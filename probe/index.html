@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>browser engine probe</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; line-height: 1.5; }
+  pre { background: #f4f4f5; padding: 12px; border-radius: 6px; font-size: 12px; overflow: auto; max-height: 360px; }
+  h2 { margin-top: 32px; border-bottom: 1px solid #e4e4e7; padding-bottom: 6px; }
+  button { padding: 8px 14px; border: 1px solid #18181b; background: #18181b; color: #fff; border-radius: 6px; cursor: pointer; font: inherit; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ok { color: #047857; font-weight: 600; }
+  .err { color: #be123c; font-weight: 600; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  progress { width: 320px; height: 10px; }
+</style>
+</head>
+<body>
+<h1>browser engine probe</h1>
+
+<h2>1. capability check</h2>
+<pre id="caps">running…</pre>
+
+<h2>2. mupdf-wasm: load + extract + redact</h2>
+<div class="row">
+  <button id="run-mupdf">run mupdf probe</button>
+  <span id="mupdf-status"></span>
+</div>
+<pre id="mupdf-out"></pre>
+
+<h2>3. transformers.js: privacy-filter on WebGPU</h2>
+<div class="row">
+  <button id="run-tf">run transformers probe</button>
+  <progress id="tf-progress" max="100" value="0" hidden></progress>
+  <span id="tf-status"></span>
+</div>
+<pre id="tf-out"></pre>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const log = (el, line) => { const e = $(el); e.textContent += line + '\n'; e.scrollTop = e.scrollHeight; };
+
+// ---------- 1. capability check ----------
+async function checkCaps() {
+  const out = [];
+  out.push('user agent: ' + navigator.userAgent);
+  out.push('device memory: ' + (navigator.deviceMemory ?? 'unknown') + ' GB');
+  out.push('hardware concurrency: ' + navigator.hardwareConcurrency);
+  out.push('cross-origin isolated: ' + self.crossOriginIsolated);
+  out.push('shared array buffer: ' + (typeof SharedArrayBuffer !== 'undefined'));
+  if (!('gpu' in navigator)) {
+    out.push('webgpu: NOT SUPPORTED (navigator.gpu missing)');
+  } else {
+    try {
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) {
+        out.push('webgpu: adapter request returned null');
+      } else {
+        out.push('webgpu: adapter OK');
+        out.push('  maxBufferSize: ' + (adapter.limits.maxBufferSize / 1024 / 1024).toFixed(0) + ' MB');
+        out.push('  maxStorageBufferBindingSize: ' + (adapter.limits.maxStorageBufferBindingSize / 1024 / 1024).toFixed(0) + ' MB');
+        out.push('  features: ' + [...adapter.features].slice(0, 8).join(', ') + (adapter.features.size > 8 ? '...' : ''));
+        // adapter.info is the modern way to get GPU info
+        if (adapter.info) {
+          out.push('  vendor: ' + adapter.info.vendor + '  arch: ' + adapter.info.architecture + '  device: ' + adapter.info.device);
+        }
+      }
+    } catch (e) {
+      out.push('webgpu: requestAdapter threw: ' + e.message);
+    }
+  }
+  $('caps').textContent = out.join('\n');
+}
+checkCaps();
+
+// ---------- 2. mupdf probe ----------
+$('run-mupdf').addEventListener('click', async () => {
+  const btn = $('run-mupdf');
+  const out = 'mupdf-out';
+  btn.disabled = true;
+  $('mupdf-out').textContent = '';
+  $('mupdf-status').innerHTML = '';
+  try {
+    log(out, 'importing mupdf from CDN…');
+    const t0 = performance.now();
+    const mupdf = await import('https://cdn.jsdelivr.net/npm/mupdf@1.27.0/dist/mupdf.js');
+    log(out, '  imported in ' + (performance.now() - t0).toFixed(0) + 'ms');
+    log(out, '  exports: ' + Object.keys(mupdf).slice(0, 10).join(', ') + '...');
+
+    log(out, 'fetching attention-is-all-you-need.pdf…');
+    const t1 = performance.now();
+    const r = await fetch('/assets/attention-is-all-you-need.pdf');
+    const buf = new Uint8Array(await r.arrayBuffer());
+    log(out, '  ' + buf.length + ' bytes in ' + (performance.now() - t1).toFixed(0) + 'ms');
+
+    log(out, 'opening document…');
+    const doc = mupdf.PDFDocument.openDocument(buf, 'application/pdf');
+    log(out, '  ' + doc.countPages() + ' pages');
+
+    log(out, 'extracting structured text from page 0…');
+    const page = doc.loadPage(0);
+    const stext = page.toStructuredText('preserve-whitespace');
+    const json = JSON.parse(stext.asJSON(1));
+    log(out, '  blocks: ' + json.blocks.length);
+    let charCount = 0;
+    for (const b of json.blocks) {
+      if (b.type !== 'text') continue;
+      for (const l of b.lines || []) charCount += (l.text || '').length;
+    }
+    log(out, '  total char count: ' + charCount);
+    // Preview the first text block
+    const first = json.blocks.find(b => b.type === 'text');
+    if (first && first.lines && first.lines[0]) {
+      log(out, '  first line text: ' + JSON.stringify(first.lines[0].text || ''));
+      log(out, '  first line bbox: ' + JSON.stringify(first.lines[0].bbox));
+    }
+
+    log(out, 'rendering page 0 to PNG…');
+    const t2 = performance.now();
+    const pixmap = page.toPixmap(mupdf.Matrix.scale(1.5, 1.5), mupdf.ColorSpace.DeviceRGB, false);
+    const png = pixmap.asPNG();
+    log(out, '  ' + png.length + ' bytes PNG in ' + (performance.now() - t2).toFixed(0) + 'ms');
+
+    log(out, 'creating redaction annotation over a known email…');
+    // Search for an email and put redaction over its quad
+    const quads = stext.search('avaswani@google.com', 1);
+    log(out, '  search hits: ' + quads.length);
+    if (quads.length > 0 && quads[0].length > 0) {
+      // Quad runtime shape is a flat 8-number array: [ul.x, ul.y, ur.x, ur.y, ll.x, ll.y, lr.x, lr.y]
+      const q = quads[0][0];
+      const xs = [q[0], q[2], q[4], q[6]];
+      const ys = [q[1], q[3], q[5], q[7]];
+      const rect = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+      log(out, '  rect: ' + JSON.stringify(rect));
+      const annot = page.createAnnotation('Redact');
+      annot.setRect(rect);
+      page.applyRedactions();
+      log(out, '  redaction applied');
+    }
+
+    log(out, 'saving redacted PDF to buffer…');
+    const t3 = performance.now();
+    const outBuf = doc.saveToBuffer('garbage,deflate').asUint8Array();
+    log(out, '  ' + outBuf.length + ' bytes in ' + (performance.now() - t3).toFixed(0) + 'ms');
+
+    // Verify the email is gone in the redacted PDF
+    const doc2 = mupdf.PDFDocument.openDocument(outBuf, 'application/pdf');
+    const stext2 = doc2.loadPage(0).toStructuredText('preserve-whitespace');
+    const hits2 = stext2.search('avaswani@google.com', 1);
+    log(out, 'verify: search for avaswani@google.com in redacted: ' + hits2.length + ' (want 0)');
+
+    $('mupdf-status').innerHTML = hits2.length === 0 ? '<span class="ok">PASS</span>' : '<span class="err">FAIL: text still present</span>';
+  } catch (e) {
+    log(out, 'ERROR: ' + e.message);
+    log(out, e.stack);
+    $('mupdf-status').innerHTML = '<span class="err">FAIL</span>';
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---------- 3. transformers.js probe ----------
+$('run-tf').addEventListener('click', async () => {
+  const btn = $('run-tf');
+  const out = 'tf-out';
+  btn.disabled = true;
+  $('tf-out').textContent = '';
+  $('tf-status').innerHTML = '';
+  $('tf-progress').hidden = false;
+  $('tf-progress').value = 0;
+
+  try {
+    log(out, 'importing @huggingface/transformers from CDN…');
+    const t0 = performance.now();
+    const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@latest');
+    log(out, '  imported in ' + (performance.now() - t0).toFixed(0) + 'ms');
+
+    log(out, 'loading openai/privacy-filter (q4 / webgpu) — first run downloads ~800 MB');
+    const tracker = {};
+    const onProgress = data => {
+      if (data.status === 'progress' && data.file) {
+        tracker[data.file] = (data.loaded / (data.total || 1)) * 100;
+        const arr = Object.values(tracker);
+        const avg = arr.reduce((s, v) => s + v, 0) / arr.length;
+        $('tf-progress').value = avg;
+        $('tf-status').textContent = 'loading: ' + Math.round(avg) + '% (' + Object.keys(tracker).length + ' files)';
+      } else if (data.status) {
+        log(out, '  [' + data.status + '] ' + (data.file || ''));
+      }
+    };
+    const t1 = performance.now();
+    const classifier = await pipeline('token-classification', 'openai/privacy-filter', {
+      device: 'webgpu',
+      dtype: 'q4',
+      progress_callback: onProgress,
+    });
+    log(out, '  loaded in ' + ((performance.now() - t1) / 1000).toFixed(1) + 's');
+    $('tf-progress').hidden = true;
+    $('tf-status').textContent = 'running inference…';
+
+    const sample = `My name is Harry Potter and my email is harry.potter@hogwarts.edu. I live at 4 Privet Drive, Little Whinging, Surrey. My phone is +44 20 7946 0958.`;
+    const t2 = performance.now();
+    const ents = await classifier(sample, { aggregation_strategy: 'simple' });
+    log(out, 'inference (' + sample.length + ' chars) in ' + (performance.now() - t2).toFixed(0) + 'ms');
+    log(out, 'entities:');
+    for (const e of ents) {
+      log(out, '  [' + (e.entity_group || e.entity) + '] score=' + e.score.toFixed(3) + '  ' + JSON.stringify(e.word));
+    }
+
+    $('tf-status').innerHTML = '<span class="ok">PASS</span> ' + ents.length + ' entities';
+  } catch (e) {
+    log(out, 'ERROR: ' + e.message);
+    log(out, e.stack);
+    $('tf-status').innerHTML = '<span class="err">FAIL</span>';
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
