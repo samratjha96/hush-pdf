@@ -1,0 +1,17 @@
+services:
+  hush:
+    build: .
+    image: hush-pdf:latest
+    container_name: hush-pdf
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      HUSH_SESSION_TTL_SECONDS: "900"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

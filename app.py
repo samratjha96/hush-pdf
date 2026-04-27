@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -27,7 +28,8 @@ device_in_use: str = "cpu"
 INFERENCE_BATCH_SIZE = 4
 
 SESSIONS: dict[str, dict] = {}
-SESSION_TTL_SECONDS = 1800
+SESSION_TTL_SECONDS = int(os.environ.get("HUSH_SESSION_TTL_SECONDS", "900"))
+SESSION_SWEEP_INTERVAL = 60
 
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 URL_RE = re.compile(
@@ -82,7 +84,18 @@ async def lifespan(app: FastAPI):
         else:
             raise
     print(f"Model ready on {device_in_use}.")
-    yield
+
+    async def _sweep_loop() -> None:
+        while True:
+            await asyncio.sleep(SESSION_SWEEP_INTERVAL)
+            _gc_sessions()
+
+    sweeper = asyncio.create_task(_sweep_loop())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
+        SESSIONS.clear()
 
 
 def _empty_device_cache() -> None:
@@ -2502,6 +2515,12 @@ class RedactRequest(BaseModel):
 async def api_redact(req: RedactRequest) -> Response:
     out_pdf, _ = apply_session_redactions(req.session_id, set(req.accepted_occurrence_ids))
     return Response(content=out_pdf, media_type="application/pdf")
+
+
+@app.post("/api/discard/{session_id}")
+def api_discard(session_id: str) -> JSONResponse:
+    existed = SESSIONS.pop(session_id, None) is not None
+    return JSONResponse({"discarded": existed})
 
 
 class MarkRequest(BaseModel):
