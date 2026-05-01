@@ -1,162 +1,9 @@
-from __future__ import annotations
-
-import asyncio
-import io
-import json
-import os
-import re
-import secrets
-import subprocess
-import tempfile
-import time
-from collections import defaultdict
-from contextlib import asynccontextmanager
-
-# Allow MPS to fall back to CPU for ops it doesn't implement.
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-
-import fitz
-import torch
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from transformers import pipeline
-
-classifier = None
-device_in_use: str = "cpu"
-INFERENCE_BATCH_SIZE = 4
-
-SESSIONS: dict[str, dict] = {}
-SESSION_TTL_SECONDS = int(os.environ.get("HUSH_SESSION_TTL_SECONDS", "900"))
-SESSION_SWEEP_INTERVAL = 60
-
-EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-URL_RE = re.compile(
-    r"https?://[^\s)\]<>\"']+|\bwww\.[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:/[^\s)\]<>\"']*)?"
-)
-PHONE_RE = re.compile(
-    r"""(?x)
-    (?<!\w)(?<!\d)
-    (?:
-        \+\d{1,3}[\s.-]\d{1,4}[\s.-]\d{2,4}[\s.-]\d{2,4}(?:[\s.-]\d{2,4})?
-      | \(\d{3}\)\s?\d{3}[\s.-]\d{4}
-      | \d{3}[.\-]\d{3}[.\-]\d{4}
-      | \+\d{10,15}
-    )
-    (?!\d)(?!\w)
-    """
-)
-
-
-def _pick_device() -> str:
-    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        return "mps"
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global classifier, device_in_use
-    device = _pick_device()
-    print(f"Loading openai/privacy-filter on {device}...")
-    try:
-        classifier = pipeline(
-            task="token-classification",
-            model="openai/privacy-filter",
-            aggregation_strategy="simple",
-            device=device,
-        )
-        _ = classifier("warmup John Doe john@example.com")
-        device_in_use = device
-    except Exception as e:
-        if device != "cpu":
-            print(f"  {device} failed ({e}), falling back to cpu")
-            classifier = pipeline(
-                task="token-classification",
-                model="openai/privacy-filter",
-                aggregation_strategy="simple",
-                device="cpu",
-            )
-            device_in_use = "cpu"
-        else:
-            raise
-    print(f"Model ready on {device_in_use}.")
-
-    async def _sweep_loop() -> None:
-        while True:
-            await asyncio.sleep(SESSION_SWEEP_INTERVAL)
-            _gc_sessions()
-
-    sweeper = asyncio.create_task(_sweep_loop())
-    try:
-        yield
-    finally:
-        sweeper.cancel()
-        SESSIONS.clear()
-
-
-def _empty_device_cache() -> None:
-    if device_in_use == "mps":
-        try:
-            torch.mps.empty_cache()
-        except Exception:
-            pass
-    elif device_in_use == "cuda":
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-
-def _classify_batched(texts: list[str]) -> list[list[dict]]:
-    if not texts or classifier is None:
-        return [[] for _ in texts]
-    out: list[list[dict]] = []
-    for i in range(0, len(texts), INFERENCE_BATCH_SIZE):
-        chunk = texts[i : i + INFERENCE_BATCH_SIZE]
-        try:
-            r = classifier(chunk, batch_size=len(chunk))
-        except Exception as e:
-            print(f"  chunk {i}-{i+len(chunk)} failed on {device_in_use}: {e}; retrying per-item on cpu")
-            r = []
-            cpu_clf = pipeline(
-                task="token-classification",
-                model="openai/privacy-filter",
-                aggregation_strategy="simple",
-                device="cpu",
-            )
-            for t in chunk:
-                r.append(cpu_clf(t))
-        if r and isinstance(r, list) and r and isinstance(r[0], dict):
-            r = [r]
-        out.extend(r)
-        _empty_device_cache()
-    return out
-
-
-def _gc_sessions() -> None:
-    now = time.time()
-    expired = [k for k, v in SESSIONS.items() if now - v["created_at"] > SESSION_TTL_SECONDS]
-    for k in expired:
-        SESSIONS.pop(k, None)
-
-
-app = FastAPI(lifespan=lifespan)
-if os.path.isdir("assets"):
-    app.mount("/assets", StaticFiles(directory="assets"), name="assets")
-if os.path.isdir("probe"):
-    app.mount("/probe", StaticFiles(directory="probe", html=True), name="probe")
-
-
-INDEX_HTML = r"""<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Redactor — local PDF privacy</title>
+<title>Hush PDF — private PDF cleanup</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -233,7 +80,6 @@ INDEX_HTML = r"""<!doctype html>
     transition: border-color 160ms var(--ease), background 160ms var(--ease);
   }
   .engine-pill[data-engine-id="browser"] { color: #047857; border-color: rgba(4, 120, 87, 0.25); background: rgba(4, 120, 87, 0.04); }
-  .engine-pill[data-engine-id="server"]  { color: #b45309; border-color: rgba(180, 83, 9, 0.28); background: rgba(180, 83, 9, 0.04); }
   .engine-pill[data-engine-id="loading"] { color: var(--muted); }
   .engine-pill-dot {
     width: 6px; height: 6px; border-radius: 50%; background: currentColor;
@@ -286,7 +132,7 @@ INDEX_HTML = r"""<!doctype html>
   }
   .upload-shell .right-col {
     padding: 64px 64px 64px 0;
-    display: flex; align-items: center; justify-content: center;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
   }
   .kicker {
     font-size: 11px; font-weight: 500; letter-spacing: 0.16em; text-transform: uppercase;
@@ -340,17 +186,30 @@ INDEX_HTML = r"""<!doctype html>
     pointer-events: none;
   }
   .drop-card.over { transform: translateY(-2px); border-color: var(--ink); }
+  .drop-card.unsupported {
+    border-color: #fecaca;
+    box-shadow: 0 4px 12px -6px rgba(153,27,27,0.18), 0 32px 60px -28px rgba(153,27,27,0.22);
+  }
+  .drop-card.unsupported .drop-zone {
+    cursor: not-allowed;
+    opacity: 0.68;
+  }
+  .drop-card.unsupported .drop-icon {
+    color: var(--err-fg);
+    border-color: #fecaca;
+    background: var(--err-bg);
+  }
   .drop-card .drop-zone {
-    border: 1.5px dashed var(--line-strong);
+    border: 0;
     border-radius: 18px;
     padding: 56px 20px;
     text-align: center;
     cursor: pointer;
-    transition: border-color 160ms var(--ease), background 160ms var(--ease);
+    transition: background 160ms var(--ease);
     position: relative;
   }
-  .drop-card .drop-zone:hover { border-color: var(--ink); background: rgba(24,24,27,0.025); }
-  .drop-card.over .drop-zone { border-color: var(--ink); background: rgba(24,24,27,0.04); }
+  .drop-card .drop-zone:hover { background: transparent; }
+  .drop-card.over .drop-zone { background: transparent; }
   .drop-card input[type=file] { display: none; }
   .drop-icon {
     width: 38px; height: 38px; margin: 0 auto 16px;
@@ -372,7 +231,7 @@ INDEX_HTML = r"""<!doctype html>
   }
   .drop-meta b { display: block; color: var(--ink); font-weight: 500; font-size: 12.5px; margin-bottom: 2px; letter-spacing: -0.005em; }
 
-  .upload-status { margin-top: 22px; }
+  .upload-status { width: 100%; max-width: 480px; margin-top: 18px; }
   .status {
     padding: 14px 16px; border-radius: 12px;
     background: var(--panel); border: 1px solid var(--line);
@@ -381,11 +240,29 @@ INDEX_HTML = r"""<!doctype html>
     display: flex; align-items: center; gap: 12px;
   }
   .status.error { background: var(--err-bg); border-color: #fecaca; color: var(--err-fg); }
+  .status.error .status-help {
+    margin: 8px 0 0; padding-left: 18px;
+    color: var(--err-fg); opacity: 0.9;
+  }
+  .status.error .status-help li { margin: 3px 0; }
+  .status.notice {
+    background: #fff7ed;
+    border-color: #fed7aa;
+    color: #9a3412;
+  }
+  .status.notice .status-help {
+    margin: 8px 0 0; padding-left: 18px;
+    color: #9a3412; opacity: 0.9;
+  }
+  .status.notice .status-help li { margin: 3px 0; }
   .spinner {
     width: 14px; height: 14px; flex: none;
     border-radius: 999px;
-    border: 1.5px solid rgba(24,24,27,0.18);
-    border-top-color: var(--ink);
+    border: 0;
+    background: conic-gradient(from 0deg, transparent 0 230deg, currentColor 230deg 360deg);
+    color: var(--ink);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0);
+    mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0);
     animation: spin 720ms linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -883,12 +760,12 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 
 <div class="topbar">
-  <div class="brand"><span class="dot"></span> redactor</div>
+  <div class="brand"><span class="dot"></span> Hush PDF</div>
   <div class="meta" id="topmeta"></div>
   <div class="engine-slot">
     <span class="engine-pill" id="engine-pill" data-engine-id="loading" title="Where detection runs">
       <span class="engine-pill-dot" aria-hidden="true"></span>
-      <span class="engine-pill-text">checking device</span>
+      <span class="engine-pill-text">private mode</span>
     </span>
   </div>
   <div class="right" id="topactions"></div>
@@ -897,13 +774,13 @@ INDEX_HTML = r"""<!doctype html>
 <!-- ==================== UPLOAD STAGE ==================== -->
 <section id="stage-upload" class="upload-shell">
   <div class="left-col">
-    <div class="kicker">local-only PII redaction</div>
+    <div class="kicker">private PDF cleanup</div>
     <h1>The PDF stays<br>on your laptop.</h1>
-    <p class="lead">Names, addresses, emails, account numbers, and secrets — flagged in place. You decide what gets removed from the underlying text layer.</p>
+    <p class="lead">Don’t get caught in your own Epstein files redaction fiasco.</p>
     <ul class="promises">
-      <li><span class="pmark"></span><div><b id="promise-1-title">Nothing leaves this machine.</b> <span id="promise-1-body">Inference runs on this device, never the cloud.</span></div></li>
-      <li><span class="pmark"></span><div><b>Real text deletion.</b> Redactions strip the bytes — not just paint over them with black rectangles.</div></li>
-      <li><span class="pmark"></span><div><b>You're the editor.</b> Every candidate is shown in context. You confirm one by one, or in bulk.</div></li>
+      <li><span class="pmark"></span><div><b id="promise-1-title">Nothing leaves this browser tab.</b> <span id="promise-1-body">Your PDF is checked in this tab, without a cloud upload.</span></div></li>
+      <li><span class="pmark"></span><div><b>The Epstein-files lesson.</b> A black rectangle is not privacy if copy-paste can still find the text underneath.</div></li>
+      <li><span class="pmark"></span><div><b>You're in control.</b> Review every find, keep what belongs, and remove the rest.</div></li>
     </ul>
   </div>
   <div class="right-col">
@@ -917,15 +794,15 @@ INDEX_HTML = r"""<!doctype html>
         <div class="drop-sub">Up to a few hundred pages</div>
       </label>
       <div class="drop-meta">
-        <div><b>Model</b>openai/privacy-filter</div>
-        <div><b>Categories</b>person, address, email, phone, url, date, account, secret</div>
-        <div><b>Inference</b><span id="drop-meta-inference">checking device…</span></div>
-        <div><b>PDF I/O</b><span id="drop-meta-io">checking device…</span></div>
+        <div><b>Privacy</b><span id="drop-meta-inference">stays in this browser tab</span></div>
+        <div><b>Looks for</b>names, addresses, emails, phone numbers, links, dates, accounts, secrets</div>
+        <div><b>Review</b>everything found is selected first</div>
+        <div><b>Result</b><span id="drop-meta-io">removes selected text from the PDF</span></div>
       </div>
     </div>
+    <div id="upload-status" class="upload-status"></div>
   </div>
 </section>
-<div id="upload-status" class="upload-status" style="padding: 0 64px 40px;"></div>
 
 <!-- ==================== REVIEW STAGE ==================== -->
 <section id="stage-review" class="review-shell hidden">
@@ -933,7 +810,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="pane-head">
       <div class="summary">
         <div>
-          <div class="label">candidates marked</div>
+          <div class="label">selected for removal</div>
           <div class="count"><span id="checked-count">0</span><span class="of">/<span id="total-count">0</span></span></div>
         </div>
         <div>
@@ -958,11 +835,11 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
       <div class="head-right">
-        <button class="tool-btn" id="preview-toggle" title="Preview the redacted output (P)">
+        <button class="tool-btn" id="preview-toggle" title="Preview the cleaned PDF (P)">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
           Preview<span class="kbd">P</span>
         </button>
-        <button class="tool-btn" id="mark-toggle" title="Mark a region for redaction (M)">
+        <button class="tool-btn" id="mark-toggle" title="Mark an area to remove (M)">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h6v6H3z"/><path d="M15 15h6v6h-6z"/><path d="M9 9l6 6"/></svg>
           Mark area<span class="kbd">M</span>
         </button>
@@ -995,15 +872,15 @@ INDEX_HTML = r"""<!doctype html>
     <div class="seal" aria-hidden="true">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
     </div>
-    <h2 id="done-title">Redacted.</h2>
-    <p class="sub" id="done-sub">Underlying text was deleted from the PDF. The original never left this machine.</p>
+    <h2 id="done-title">Cleaned.</h2>
+    <p class="sub" id="done-sub">Selected text was removed from the PDF. The original never left this browser tab.</p>
     <ul class="done-summary" id="done-summary"></ul>
     <div class="done-actions">
       <a class="download-btn" id="download-link" download="">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-        Download redacted PDF
+        Download cleaned PDF
       </a>
-      <button class="ghost" id="redact-another">Redact another</button>
+      <button class="ghost" id="redact-another">Clean another</button>
     </div>
   </div>
 </section>
@@ -1013,9 +890,7 @@ const $ = id => document.getElementById(id);
 const TICK_SVG = '<svg class="tick" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
 
 // ============================================================
-//  ENGINE ABSTRACTION
-//  - server: classic POST /api/* roundtrip
-//  - browser: mupdf-wasm + transformers.js, no upload (TODO)
+//  Browser PDF engine: mupdf-wasm + Transformers.js/WebGPU.
 // ============================================================
 
 async function checkCaps() {
@@ -1044,59 +919,6 @@ async function checkCaps() {
   return caps;
 }
 
-async function _formatErr(r) {
-  let detail = '';
-  try { detail = await r.text(); } catch { detail = r.statusText; }
-  try { const j = JSON.parse(detail); if (j && j.detail) detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); } catch {}
-  return detail || ('HTTP ' + r.status);
-}
-
-const ServerEngine = {
-  id: 'server',
-  label: 'local backend',
-  needsModelLoad: false,
-  isReady: true,
-  async preload() {},
-  async detect(file, progressCb) {
-    const emit = (u) => { if (progressCb) progressCb(typeof u === 'string' ? { kind: 'msg', text: u } : u); };
-    emit({ kind: 'msg', text: 'uploading to local backend on 127.0.0.1…' });
-    const fd = new FormData();
-    fd.append('pdf', file);
-    const r = await fetch('/api/detect', { method: 'POST', body: fd });
-    if (!r.ok) throw new Error(await _formatErr(r));
-    emit({ kind: 'msg', text: 'parsing response…' });
-    return r.json();
-  },
-  async pageUrl(sessionId, n) {
-    return '/api/page/' + sessionId + '/' + n + '.png?zoom=1.5';
-  },
-  async redact(sessionId, occIds) {
-    const r = await fetch('/api/redact', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ session_id: sessionId, accepted_occurrence_ids: occIds }),
-    });
-    if (!r.ok) throw new Error(await _formatErr(r));
-    return r.blob();
-  },
-  async mark(sessionId, page, rect) {
-    const r = await fetch('/api/mark', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ session_id: sessionId, page, rect }),
-    });
-    if (!r.ok) throw new Error(await _formatErr(r));
-    const { entity } = await r.json();
-    return entity;
-  },
-  async deleteEntity(sessionId, entityId) {
-    const r = await fetch('/api/entity/' + sessionId + '/' + entityId, { method: 'DELETE' });
-    if (!r.ok) throw new Error(await _formatErr(r));
-  },
-};
-
-// ===== BrowserEngine: mupdf-wasm + transformers.js =====
-
 const MUPDF_URL = 'https://cdn.jsdelivr.net/npm/mupdf@1.27.0/dist/mupdf.js';
 const TRANSFORMERS_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@latest';
 
@@ -1104,10 +926,15 @@ let _mupdf = null;
 let _classifier = null;
 let _classifierLoading = null;
 const _bSessions = new Map();
+const MODEL_MIN_SCORE = 0.75;
 
 async function _loadMupdf() {
   if (_mupdf) return _mupdf;
-  _mupdf = await import(MUPDF_URL);
+  try {
+    _mupdf = await import(MUPDF_URL);
+  } catch (err) {
+    throw new Error('Could not load the private PDF reader. Check that this browser can reach cdn.jsdelivr.net, then reload the page.');
+  }
   return _mupdf;
 }
 
@@ -1115,7 +942,13 @@ async function _loadClassifier(progressCb) {
   if (_classifier) return _classifier;
   if (_classifierLoading) return _classifierLoading;
   _classifierLoading = (async () => {
-    const tf = await import(TRANSFORMERS_URL);
+    let tf;
+    try {
+      tf = await import(TRANSFORMERS_URL);
+    } catch (err) {
+      _classifierLoading = null;
+      throw new Error('Could not load the private checker. Check that this browser can reach cdn.jsdelivr.net, then reload the page.');
+    }
     const tracker = {};
     const wrapped = data => {
       if (!progressCb) return;
@@ -1128,11 +961,20 @@ async function _loadClassifier(progressCb) {
         progressCb({ phase: 'ready', percent: 100 });
       }
     };
-    const clf = await tf.pipeline('token-classification', 'openai/privacy-filter', {
-      device: 'webgpu',
-      dtype: 'q4',
-      progress_callback: wrapped,
-    });
+    let clf;
+    try {
+      clf = await tf.pipeline('token-classification', 'openai/privacy-filter', {
+        device: 'webgpu',
+        dtype: 'q4',
+        progress_callback: wrapped,
+      });
+    } catch (err) {
+      _classifierLoading = null;
+      if (String(err && err.message || err).includes('fetch')) {
+        throw new Error('Could not download the private checker. A browser setting, VPN, firewall, or company network may be blocking the model files from Hugging Face.');
+      }
+      throw new Error('Could not start the private checker. Make sure WebGPU is enabled in Chrome or Edge, then reload the page.');
+    }
     _classifier = clf;
     _classifierLoading = null;
     return clf;
@@ -1201,6 +1043,26 @@ function _snippetLocal(text, lo, hi, pad = 80) {
   return { before, match, after };
 }
 
+function _looksLikeCompactPrivateSpan(label, value, rect, pageDim) {
+  const clean = value.replace(/\s+/g, ' ').trim();
+  if (clean.length < 3 || clean.length > 180) return false;
+  if (clean.split(/\s+/).length > 12) return false;
+  if (/[.!?]\s+\S/.test(clean)) return false;
+  if (clean.includes('\n')) return false;
+
+  const [x0, y0, x1, y1] = rect;
+  const rectArea = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+  const pageArea = Math.max(1, pageDim.w * pageDim.h);
+  if (rectArea / pageArea > 0.08) return false;
+  if ((x1 - x0) / Math.max(1, pageDim.w) > 0.75) return false;
+  if ((y1 - y0) / Math.max(1, pageDim.h) > 0.12) return false;
+
+  if (label === 'PRIVATE_EMAIL') return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean);
+  if (label === 'PRIVATE_URL') return !/\s/.test(clean);
+  if (label === 'PRIVATE_PHONE') return clean.replace(/\D/g, '').length >= 7;
+  return true;
+}
+
 function _newSessionId() {
   const buf = new Uint8Array(12);
   crypto.getRandomValues(buf);
@@ -1223,7 +1085,7 @@ const BrowserEngine = {
     emit({ kind: 'msg', text: 'opening PDF…' });
     const mupdf = await _loadMupdf();
     if (!_classifier) {
-      emit({ kind: 'msg', text: 'first run: downloading detection model (~800 MB). Cached locally for next time.' });
+      emit({ kind: 'msg', text: 'first run: getting the private checker ready. Saved in this browser for next time.' });
       await _loadClassifier(p => {
         if (p.phase === 'download') {
           emit({ kind: 'download', percent: p.percent, files: p.files });
@@ -1245,7 +1107,8 @@ const BrowserEngine = {
       emit({ kind: 'page', i: i + 1, total: pageCount });
       const page = doc.loadPage(i);
       const bb = page.getBounds();
-      pageDims.push({ w: bb[2] - bb[0], h: bb[3] - bb[1] });
+      const pageDim = { w: bb[2] - bb[0], h: bb[3] - bb[1] };
+      pageDims.push(pageDim);
 
       const stext = page.toStructuredText('preserve-whitespace');
       const { text, bboxes } = _extractTextWithBboxes(stext);
@@ -1257,11 +1120,13 @@ const BrowserEngine = {
       for (const e of ents) {
         const label = (e.entity_group || e.entity || '').toUpperCase();
         if (!label) continue;
+        if (Number(e.score ?? 1) < MODEL_MIN_SCORE) continue;
         const span = bboxes.slice(e.start, e.end);
         const rect = _bboxUnion(span);
         if (!rect) continue;
         const word = text.slice(e.start, e.end).trim();
         if (!word) continue;
+        if (!_looksLikeCompactPrivateSpan(label, word, rect, pageDim)) continue;
         const key = label + '\x00' + word.toLowerCase();
         let rec = entitiesByKey.get(key);
         if (!rec) {
@@ -1388,6 +1253,21 @@ const BrowserEngine = {
   },
 };
 
+const UnsupportedEngine = {
+  id: 'unsupported',
+  label: 'WebGPU needed',
+  needsModelLoad: false,
+  isReady: false,
+  async preload() {},
+  async detect() {
+    throw new Error('WEBGPU_UNAVAILABLE');
+  },
+  async pageUrl() { throw new Error('WebGPU is required.'); },
+  async redact() { throw new Error('WebGPU is required.'); },
+  async mark() { throw new Error('WebGPU is required.'); },
+  async deleteEntity() { throw new Error('WebGPU is required.'); },
+};
+
 function setEnginePill(engineId, label) {
   const pill = $('engine-pill');
   if (!pill) return;
@@ -1403,18 +1283,12 @@ function formatGpuLabel(fallback) {
 }
 
 function engineTooltip(engineId) {
-  if (engineId === 'loading') return 'Checking device capabilities…';
-  const c = window.__caps || {};
-  const gpu = formatGpuLabel('GPU');
-  const buf = c.maxBufferMB ? `${c.maxBufferMB} MB buffer` : '';
-  const capLine = c.webgpu ? `WebGPU: ${gpu}${buf ? ' · ' + buf : ''}` : 'WebGPU not available on this device';
+  if (engineId === 'loading') return 'Checking this device…';
   if (engineId === 'browser') {
-    const toggle = window.__browserCapable ? '\nClick to switch to local backend.' : '';
-    return `Detection runs in this browser tab. The PDF never leaves this device.\n${capLine}${toggle}`;
+    return 'Your PDF is checked in this browser tab and never leaves this device.';
   }
-  if (engineId === 'server') {
-    const toggle = window.__browserCapable ? '\nClick to switch to in-browser inference.' : '\nThis device cannot run the model in-browser.';
-    return `Detection runs on the local FastAPI backend on 127.0.0.1.\n${capLine}${toggle}`;
+  if (engineId === 'unsupported') {
+    return 'Hush PDF needs WebGPU so it can check PDFs privately in your browser. Use current Chrome or Edge with hardware acceleration enabled.';
   }
   return '';
 }
@@ -1424,18 +1298,43 @@ function setPromiseCopy(engineId) {
   const body = $('promise-1-body');
   const dropInf = $('drop-meta-inference');
   const dropIo = $('drop-meta-io');
-  const gpu = formatGpuLabel('this device');
   if (engineId === 'browser') {
     if (title) title.textContent = 'Nothing leaves this browser tab.';
-    if (body) body.textContent = `Inference runs on ${gpu} via WebGPU. No upload, no server round-trip.`;
-    if (dropInf) dropInf.textContent = `${gpu} · WebGPU · q4`;
-    if (dropIo) dropIo.textContent = 'mupdf-wasm in this browser';
-  } else {
-    if (title) title.textContent = 'Nothing leaves this machine.';
-    if (body) body.textContent = 'Inference runs on a local FastAPI backend on 127.0.0.1 — same laptop, no cloud.';
-    if (dropInf) dropInf.textContent = 'transformers (CPU) on 127.0.0.1';
-    if (dropIo) dropIo.textContent = 'pymupdf on 127.0.0.1';
+    if (body) body.textContent = 'Your PDF is checked in this tab, without a cloud upload.';
+    if (dropInf) dropInf.textContent = 'stays in this browser tab';
+    if (dropIo) dropIo.textContent = 'removes selected text from the PDF';
+    return;
   }
+  if (engineId === 'unsupported') {
+    if (title) title.textContent = 'Nothing leaves this browser tab.';
+    if (body) body.textContent = 'Use current Chrome or Edge with WebGPU enabled to check PDFs privately on this device.';
+    if (dropInf) dropInf.textContent = 'requires WebGPU';
+    if (dropIo) dropIo.textContent = 'no cloud fallback';
+  }
+}
+
+function webGpuHelpList() {
+  return '<ol class="status-help">' +
+    '<li>Use the latest Chrome or Microsoft Edge.</li>' +
+    '<li>Turn on hardware acceleration in browser settings.</li>' +
+    '<li>Update your graphics driver, then fully restart the browser.</li>' +
+    '<li>If you are in Remote Desktop, a VM, or a managed work browser, try a normal local browser session.</li>' +
+    '<li>Open <span class="mono">chrome://gpu</span> or <span class="mono">edge://gpu</span> and check that WebGPU is available.</li>' +
+  '</ol>';
+}
+
+function showWebGpuUnavailableNotice() {
+  dropCard.classList.add('unsupported');
+  fileInput.disabled = true;
+  dropZone.setAttribute('aria-disabled', 'true');
+  uploadStatus.innerHTML =
+    '<div class="status notice">' +
+      '<div class="status-body">' +
+        '<div class="status-line"><b>Private checking needs WebGPU.</b></div>' +
+        '<div class="status-sub">Hush PDF keeps your document in the browser, so this device needs browser GPU support before you choose a PDF.</div>' +
+        webGpuHelpList() +
+      '</div>' +
+    '</div>';
 }
 
 const ENGINE_MIN_BUFFER_MB = 1024;
@@ -1443,55 +1342,17 @@ const caps = await checkCaps();
 window.__caps = caps;
 const browserCapable = caps.webgpu && caps.maxBufferMB >= ENGINE_MIN_BUFFER_MB;
 
-const ENGINE_PREF_KEY = 'redactor.enginePref';
-function readEnginePref() {
-  try { return localStorage.getItem(ENGINE_PREF_KEY); } catch { return null; }
-}
-function writeEnginePref(v) {
-  try { localStorage.setItem(ENGINE_PREF_KEY, v); } catch {}
-}
-
-function pickEngine(forceId) {
-  const pref = forceId || readEnginePref();
-  if (pref === 'server') return ServerEngine;
-  if (pref === 'browser' && browserCapable) return BrowserEngine;
-  // Default: browser when capable, server otherwise.
-  return browserCapable ? BrowserEngine : ServerEngine;
-}
-
-let engine = pickEngine();
+let engine = browserCapable ? BrowserEngine : UnsupportedEngine;
 setEnginePill(engine.id, engine.label);
 setPromiseCopy(engine.id);
 window.__engine = engine;
 window.__BrowserEngine = BrowserEngine;
-window.__ServerEngine = ServerEngine;
 window.__browserCapable = browserCapable;
 
-function switchEngine(id) {
-  const next = id === 'browser' ? (browserCapable ? BrowserEngine : null) : ServerEngine;
-  if (!next) return false;
-  if (next.id === engine.id) return true;
-  engine = next;
-  window.__engine = engine;
-  setEnginePill(engine.id, engine.label);
-  setPromiseCopy(engine.id);
-  writeEnginePref(engine.id);
-  return true;
-}
-window.switchEngine = switchEngine;
-
-// Click on the engine pill to toggle (only when both engines are usable).
 let _detectInFlight = false;
 const enginePillEl = $('engine-pill');
 if (enginePillEl) {
-  enginePillEl.style.cursor = browserCapable ? 'pointer' : 'help';
-  enginePillEl.addEventListener('click', () => {
-    if (!browserCapable) return;
-    if (_detectInFlight) return;
-    const review = $('stage-review');
-    if (review && !review.classList.contains('hidden')) return; // mid-flow, ignore
-    switchEngine(engine.id === 'browser' ? 'server' : 'browser');
-  });
+  enginePillEl.style.cursor = 'help';
 }
 
 const stageUpload = $('stage-upload'), stageReview = $('stage-review'), stageDone = $('stage-done');
@@ -1500,6 +1361,7 @@ const uploadStatus = $('upload-status');
 const entitiesEl = $('entities');
 const pageImg = $('page-img'), overlayEl = $('overlay'), canvasEl = $('canvas');
 const pageInput = $('page-input'), pageTotalEl = $('page-total');
+if (engine.id === 'unsupported') showWebGpuUnavailableNotice();
 
 const state = {
   session: null,
@@ -1560,7 +1422,7 @@ function show(stage) {
     const apply = document.createElement('button');
     apply.className = 'danger';
     apply.id = 'apply-btn';
-    apply.textContent = 'Apply redactions';
+    apply.textContent = 'Remove selected';
     apply.addEventListener('click', applyRedactions);
     const cancel = document.createElement('button');
     cancel.className = 'ghost';
@@ -1613,7 +1475,7 @@ function renderUploadStatus(u, fname) {
     const pct = Math.max(0, Math.min(100, Math.round(u.percent || 0)));
     const fileLabel = u.files ? `${u.files} file${u.files === 1 ? '' : 's'}` : '';
     renderStatusPanel({
-      lineHtml: 'Downloading detection model · first run only, then cached locally',
+      lineHtml: 'Getting the private checker ready · saved in this browser for next time',
       sub: `${pct}% · ${fileLabel}`,
       percent: pct,
     });
@@ -1622,7 +1484,7 @@ function renderUploadStatus(u, fname) {
   if (u.kind === 'page') {
     const pct = u.total ? Math.round((u.i / u.total) * 100) : 0;
     renderStatusPanel({
-      lineHtml: `Analysing <span class="mono">${escapeHtml(fname || '')}</span>`,
+      lineHtml: `Checking <span class="mono">${escapeHtml(fname || '')}</span>`,
       sub: `page ${u.i} / ${u.total}`,
       percent: pct,
     });
@@ -1631,16 +1493,43 @@ function renderUploadStatus(u, fname) {
   renderStatusPanel({ lineHtml: escapeHtml(u.text || '') });
 }
 
+function showUploadError(err) {
+  const raw = String(err && err.message ? err.message : err || 'Something went wrong.');
+  let msg = raw;
+  let help = '';
+  if (raw === 'WEBGPU_UNAVAILABLE' || raw.includes('WebGPU is required')) {
+    msg = 'This browser cannot use WebGPU right now, so Hush PDF cannot check the file privately in the browser.';
+    help = webGpuHelpList();
+  }
+  if (raw === 'Failed to fetch' || raw.includes('Importing a module script failed')) {
+    msg = 'Could not download the private checker. A browser setting, VPN, firewall, or company network may be blocking the files needed to run privately in this browser.';
+    help =
+      '<ol class="status-help">' +
+        '<li>Try the latest Chrome or Microsoft Edge outside a VPN or strict company network.</li>' +
+        '<li>Allow access to <span class="mono">cdn.jsdelivr.net</span> and <span class="mono">huggingface.co</span>.</li>' +
+        '<li>Reload the page after changing network or browser settings.</li>' +
+      '</ol>';
+  }
+  uploadStatus.innerHTML =
+    '<div class="status error">' +
+      '<div class="status-body">' +
+        '<div class="status-line"><b>Could not check this PDF privately.</b></div>' +
+        '<div class="status-sub">' + escapeHtml(msg) + '</div>' +
+        help +
+      '</div>' +
+    '</div>';
+}
+
 async function detect(file) {
   state.fileName = file.name;
   const t0 = performance.now();
   _detectInFlight = true;
   document.body.classList.add('busy-detect');
-  renderUploadStatus({ kind: 'msg', text: 'Analyzing ' + file.name + ' · this can take 30 seconds to a few minutes.' });
+  renderUploadStatus({ kind: 'msg', text: 'Checking ' + file.name + ' · this can take 30 seconds to a few minutes.' });
   try {
     state.session = await engine.detect(file, u => renderUploadStatus(u, file.name));
   } catch (err) {
-    uploadStatus.innerHTML = '<div class="status error">' + escapeHtml(err.message) + '</div>';
+    showUploadError(err);
     return;
   } finally {
     _detectInFlight = false;
@@ -1903,7 +1792,7 @@ function updateSummary() {
   if (apply) {
     const hasSel = state.checkedOcc.size > 0;
     apply.disabled = !hasSel;
-    apply.title = hasSel ? '' : 'Select at least one candidate';
+    apply.title = hasSel ? '' : 'Select at least one item';
   }
 }
 
@@ -2153,7 +2042,42 @@ function cancelMarkDrag() {
   state.markDrag = null;
 }
 
+function rectArea(rect) {
+  return Math.max(0, rect[2] - rect[0]) * Math.max(0, rect[3] - rect[1]);
+}
+
+function rectOverlapRatio(a, b) {
+  const x0 = Math.max(a[0], b[0]);
+  const y0 = Math.max(a[1], b[1]);
+  const x1 = Math.min(a[2], b[2]);
+  const y1 = Math.min(a[3], b[3]);
+  const overlap = rectArea([x0, y0, x1, y1]);
+  const smaller = Math.min(rectArea(a), rectArea(b));
+  return smaller > 0 ? overlap / smaller : 0;
+}
+
+function findDuplicateManualOccurrence(page, rect) {
+  for (const ent of state.session.entities) {
+    if (ent.label !== 'MANUAL') continue;
+    for (const occ of ent.occurrences) {
+      if (occ.page === page && rectOverlapRatio(occ.rect, rect) >= 0.8) return occ.id;
+    }
+  }
+  return null;
+}
+
 async function commitMark(rect) {
+  const existingOccId = findDuplicateManualOccurrence(state.currentPage, rect);
+  if (existingOccId != null) {
+    state.checkedOcc.add(existingOccId);
+    state.currentOccId = existingOccId;
+    renderEntities();
+    updateSummary();
+    renderOverlay();
+    highlightOccRow(existingOccId);
+    return;
+  }
+
   let entity;
   try {
     entity = await engine.mark(state.session.session_id, state.currentPage, rect);
@@ -2183,25 +2107,25 @@ async function commitMark(rect) {
 function showApplyError(msg) {
   const el = $('apply-error');
   el.classList.remove('hidden');
-  el.innerHTML = '<div style="flex:1; min-width:0;"><div style="font-weight:600; margin-bottom:2px;">Could not apply redactions</div><div style="opacity:0.85;">' + escapeHtml(msg) + '</div></div><button class="x" type="button" aria-label="Dismiss">×</button>';
+  el.innerHTML = '<div style="flex:1; min-width:0;"><div style="font-weight:600; margin-bottom:2px;">Could not remove selected text</div><div style="opacity:0.85;">' + escapeHtml(msg) + '</div></div><button class="x" type="button" aria-label="Dismiss">×</button>';
   el.querySelector('.x').addEventListener('click', () => el.classList.add('hidden'));
 }
 
 function resetApplyButton() {
   const btn = $('apply-btn');
-  if (btn) { btn.disabled = false; btn.textContent = 'Apply redactions'; }
+  if (btn) { btn.disabled = false; btn.textContent = 'Remove selected'; }
 }
 
 async function applyRedactions() {
   const accepted = Array.from(state.checkedOcc);
   if (accepted.length === 0) {
-    showApplyError('Select at least one candidate to redact.');
+    showApplyError('Select at least one item to remove.');
     return;
   }
   $('apply-error').classList.add('hidden');
   const btn = $('apply-btn');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner" style="border-color: rgba(255,255,255,0.4); border-top-color: #fff; width: 12px; height: 12px;"></span>&nbsp;Applying';
+  btn.innerHTML = '<span class="spinner" style="color: #fff; width: 12px; height: 12px;"></span>&nbsp;Applying';
   let blob;
   try {
     blob = await engine.redact(state.session.session_id, accepted);
@@ -2224,7 +2148,7 @@ async function applyRedactions() {
   const labels = Object.keys(counts).sort();
   if (!labels.length) {
     const li = document.createElement('li');
-    li.innerHTML = '<span class="lbl">redactions</span><span class="val">0</span>';
+    li.innerHTML = '<span class="lbl">removed</span><span class="val">0</span>';
     ul.appendChild(li);
   }
   for (const k of labels) {
@@ -2239,382 +2163,13 @@ async function applyRedactions() {
 
   const dl = $('download-link');
   dl.href = url;
-  dl.download = 'redacted-' + state.fileName;
+  dl.download = 'cleaned-' + state.fileName;
   const sub = $('done-sub');
   if (sub) {
-    sub.textContent = engine.id === 'browser'
-      ? 'Underlying text was deleted from the PDF. The original never left this machine.'
-      : 'Underlying text was deleted by the local FastAPI backend and the redacted PDF is ready below.';
+    sub.textContent = 'Selected text was removed from the PDF. The original never left this browser tab.';
   }
   show('done');
 }
 </script>
 </body>
 </html>
-"""
-
-
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    return INDEX_HTML
-
-
-def coalesce(entities: list[dict], gap_chars: int = 2) -> list[dict]:
-    if not entities:
-        return []
-    es = sorted(entities, key=lambda e: e["start"])
-    merged: list[dict] = [dict(es[0])]
-    for e in es[1:]:
-        last = merged[-1]
-        last_label = last.get("entity_group") or last.get("entity")
-        e_label = e.get("entity_group") or e.get("entity")
-        if e_label == last_label and e["start"] - last["end"] <= gap_chars:
-            last["end"] = max(last["end"], e["end"])
-            last["score"] = min(last["score"], e["score"])
-        else:
-            merged.append(dict(e))
-    return merged
-
-
-def split_merged_span(label: str, text: str) -> list[str]:
-    if label == "PRIVATE_EMAIL":
-        return EMAIL_RE.findall(text) or [text]
-    if label == "PRIVATE_URL":
-        return URL_RE.findall(text) or [text]
-    if label == "PRIVATE_PHONE":
-        return PHONE_RE.findall(text) or [text]
-    return [text]
-
-
-def regex_backstop(text: str) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
-    for m in EMAIL_RE.finditer(text):
-        out.append(("PRIVATE_EMAIL", m.group()))
-    for m in URL_RE.finditer(text):
-        out.append(("PRIVATE_URL", m.group().rstrip(".,;:")))
-    for m in PHONE_RE.finditer(text):
-        s = m.group().strip()
-        digits = sum(c.isdigit() for c in s)
-        if digits >= 7:
-            out.append(("PRIVATE_PHONE", s))
-    return out
-
-
-def entities_from_outputs(text: str, model_output: list[dict]) -> set[tuple[str, str]]:
-    seen: set[tuple[str, str]] = set()
-    for e in coalesce(model_output):
-        label = (e.get("entity_group") or e.get("entity") or "").upper()
-        if not label:
-            continue
-        span = text[e["start"] : e["end"]].strip()
-        for piece in split_merged_span(label, span):
-            piece = piece.strip(" ,;:.()[]\"'")
-            if len(piece) >= 3:
-                seen.add((label, piece))
-    for label, s in regex_backstop(text):
-        s = s.strip(" ,;:.()[]\"'")
-        if len(s) >= 3:
-            seen.add((label, s))
-    return seen
-
-
-def liteparse_pdf(data: bytes) -> dict:
-    in_path = ""
-    out_path = ""
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as in_f:
-        in_f.write(data)
-        in_path = in_f.name
-    out_path = in_path + ".json"
-    try:
-        result = subprocess.run(
-            [
-                "npx", "-y", "@llamaindex/liteparse", "parse",
-                in_path, "--format", "json", "--no-ocr", "-q", "-o", out_path,
-            ],
-            capture_output=True,
-            timeout=300,
-        )
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"liteparse failed: {result.stderr.decode()[:500]}",
-            )
-        with open(out_path) as f:
-            return json.load(f)
-    finally:
-        for p in (in_path, out_path):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
-
-
-def _snippet(text: str, lo: int, hi: int, pad: int = 80) -> dict:
-    start = max(0, lo - pad)
-    end = min(len(text), hi + pad)
-    before = re.sub(r"\s+", " ", text[start:lo]).lstrip()
-    match = re.sub(r"\s+", " ", text[lo:hi]).strip()
-    after = re.sub(r"\s+", " ", text[hi:end]).rstrip()
-    return {
-        "before": ("…" + before) if start > 0 else before,
-        "match": match,
-        "after": (after + "…") if end < len(text) else after,
-    }
-
-
-def _find_all_offsets(text: str, needle: str) -> list[int]:
-    if not needle:
-        return []
-    out: list[int] = []
-    nl = needle.lower()
-    tl = text.lower()
-    lo = 0
-    while True:
-        idx = tl.find(nl, lo)
-        if idx < 0:
-            break
-        out.append(idx)
-        lo = idx + max(1, len(nl))
-    return out
-
-
-def detect_pdf(data: bytes) -> dict:
-    parsed = liteparse_pdf(data)
-    doc = fitz.open(stream=data, filetype="pdf")
-
-    page_texts = [p.get("text", "") for p in parsed.get("pages", [])]
-    n = min(len(page_texts), doc.page_count)
-    page_dimensions = [{"w": doc[i].rect.width, "h": doc[i].rect.height} for i in range(doc.page_count)]
-
-    non_empty_indices = [i for i in range(n) if page_texts[i].strip()]
-    non_empty_texts = [page_texts[i] for i in non_empty_indices]
-    raw_outputs = _classify_batched(non_empty_texts)
-    outputs_by_index = dict(zip(non_empty_indices, raw_outputs))
-
-    by_key: dict[tuple[str, str], dict] = {}
-    next_occ_id = 0
-
-    for i in range(n):
-        text = page_texts[i]
-        if not text.strip():
-            continue
-        page = doc[i]
-        for label, s in entities_from_outputs(text, outputs_by_index.get(i, [])):
-            rects = page.search_for(s, quads=False)
-            if not rects:
-                continue
-            offsets = _find_all_offsets(text, s)
-            key = (label, s)
-            rec = by_key.get(key)
-            if rec is None:
-                rec = {"label": label, "text": s, "occurrences": []}
-                by_key[key] = rec
-            for idx, r in enumerate(rects):
-                if idx < len(offsets):
-                    off = offsets[idx]
-                elif offsets:
-                    off = offsets[-1]
-                else:
-                    off = -1
-                snip = _snippet(text, off, off + len(s)) if off >= 0 else {
-                    "before": "", "match": s, "after": "",
-                }
-                rec["occurrences"].append({
-                    "id": next_occ_id,
-                    "page": i + 1,
-                    "rect": [r.x0, r.y0, r.x1, r.y1],
-                    "snippet": snip,
-                })
-                next_occ_id += 1
-
-    page_count = doc.page_count
-    doc.close()
-
-    entities = []
-    sorted_items = sorted(
-        by_key.items(),
-        key=lambda kv: (kv[0][0], -len(kv[1]["occurrences"]), kv[0][1]),
-    )
-    for ent_id, ((label, s), rec) in enumerate(sorted_items):
-        entities.append({
-            "id": ent_id,
-            "label": label,
-            "text": s,
-            "occurrences": rec["occurrences"],
-        })
-
-    occurrences_by_id = {
-        occ["id"]: {"entity_id": ent["id"], "page": occ["page"], "rect": occ["rect"]}
-        for ent in entities
-        for occ in ent["occurrences"]
-    }
-
-    session_id = secrets.token_urlsafe(16)
-    SESSIONS[session_id] = {
-        "pdf_bytes": data,
-        "entities": entities,
-        "pages": page_count,
-        "page_dimensions": page_dimensions,
-        "occurrences_by_id": occurrences_by_id,
-        "created_at": time.time(),
-    }
-    _gc_sessions()
-    return {
-        "session_id": session_id,
-        "pages": page_count,
-        "page_dimensions": page_dimensions,
-        "entities": entities,
-    }
-
-
-def apply_session_redactions(session_id: str, accepted_occ_ids: set[int]) -> tuple[bytes, dict[str, int]]:
-    s = SESSIONS.get(session_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="session expired or unknown")
-
-    occ_lookup = s["occurrences_by_id"]
-    ent_by_id = {e["id"]: e for e in s["entities"]}
-
-    by_page: dict[int, list[tuple[fitz.Rect, str]]] = defaultdict(list)
-    counts: dict[str, int] = defaultdict(int)
-    for oid in accepted_occ_ids:
-        rec = occ_lookup.get(oid)
-        if not rec:
-            continue
-        ent = ent_by_id.get(rec["entity_id"])
-        label = ent["label"] if ent else "UNKNOWN"
-        by_page[rec["page"] - 1].append((fitz.Rect(*rec["rect"]), label))
-
-    doc = fitz.open(stream=s["pdf_bytes"], filetype="pdf")
-    for page_idx, items in by_page.items():
-        page = doc[page_idx]
-        for rect, label in items:
-            page.add_redact_annot(rect, fill=(0, 0, 0))
-            counts[label] += 1
-        page.apply_redactions()
-
-    buf = io.BytesIO()
-    doc.save(buf, garbage=4, deflate=True, clean=True)
-    doc.close()
-    SESSIONS.pop(session_id, None)
-    return buf.getvalue(), dict(counts)
-
-
-@app.post("/api/detect")
-async def api_detect(pdf: UploadFile = File(...)) -> JSONResponse:
-    data = await pdf.read()
-    return JSONResponse(detect_pdf(data))
-
-
-class RedactRequest(BaseModel):
-    session_id: str
-    accepted_occurrence_ids: list[int]
-
-
-@app.post("/api/redact")
-async def api_redact(req: RedactRequest) -> Response:
-    out_pdf, _ = apply_session_redactions(req.session_id, set(req.accepted_occurrence_ids))
-    return Response(content=out_pdf, media_type="application/pdf")
-
-
-@app.post("/api/discard/{session_id}")
-def api_discard(session_id: str) -> JSONResponse:
-    existed = SESSIONS.pop(session_id, None) is not None
-    return JSONResponse({"discarded": existed})
-
-
-class MarkRequest(BaseModel):
-    session_id: str
-    page: int
-    rect: list[float]
-
-
-@app.post("/api/mark")
-def api_mark(req: MarkRequest) -> JSONResponse:
-    s = SESSIONS.get(req.session_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="session expired or unknown")
-    if req.page < 1 or req.page > s["pages"]:
-        raise HTTPException(status_code=404, detail="page out of range")
-    if len(req.rect) != 4:
-        raise HTTPException(status_code=400, detail="rect must be [x0, y0, x1, y1]")
-    x0, y0, x1, y1 = req.rect
-    rect = fitz.Rect(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
-    if rect.width < 2 or rect.height < 2:
-        raise HTTPException(status_code=400, detail="rect too small")
-
-    doc = fitz.open(stream=s["pdf_bytes"], filetype="pdf")
-    try:
-        page = doc[req.page - 1]
-        rect = rect & page.rect
-        if rect.is_empty:
-            raise HTTPException(status_code=400, detail="rect is outside the page")
-        words = page.get_text("words", clip=rect)
-        text_under = re.sub(r"\s+", " ", " ".join(w[4] for w in words)).strip()
-    finally:
-        doc.close()
-
-    if text_under:
-        display_text = text_under if len(text_under) <= 80 else text_under[:79].rstrip() + "…"
-    else:
-        display_text = "[marked region]"
-    next_ent_id = max((e["id"] for e in s["entities"]), default=-1) + 1
-    next_occ_id = max(s["occurrences_by_id"].keys(), default=-1) + 1
-    rect_coords = [rect.x0, rect.y0, rect.x1, rect.y1]
-    occurrence = {
-        "id": next_occ_id,
-        "page": req.page,
-        "rect": rect_coords,
-        "snippet": {"before": "", "match": display_text, "after": ""},
-    }
-    entity = {
-        "id": next_ent_id,
-        "label": "MANUAL",
-        "text": display_text,
-        "occurrences": [occurrence],
-    }
-    s["entities"].append(entity)
-    s["occurrences_by_id"][next_occ_id] = {
-        "entity_id": next_ent_id,
-        "page": req.page,
-        "rect": rect_coords,
-    }
-    return JSONResponse({"entity": entity})
-
-
-@app.delete("/api/entity/{session_id}/{entity_id}")
-def api_delete_entity(session_id: str, entity_id: int) -> JSONResponse:
-    s = SESSIONS.get(session_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="session expired or unknown")
-    target = next((e for e in s["entities"] if e["id"] == entity_id), None)
-    if not target:
-        raise HTTPException(status_code=404, detail="entity not found")
-    if target["label"] != "MANUAL":
-        raise HTTPException(status_code=400, detail="only manual marks can be deleted")
-    for occ in target["occurrences"]:
-        s["occurrences_by_id"].pop(occ["id"], None)
-    s["entities"] = [e for e in s["entities"] if e["id"] != entity_id]
-    return JSONResponse({"deleted": entity_id})
-
-
-@app.get("/api/page/{session_id}/{page_num}.png")
-def api_page(session_id: str, page_num: int, zoom: float = 1.5) -> Response:
-    s = SESSIONS.get(session_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="session expired or unknown")
-    if page_num < 1 or page_num > s["pages"]:
-        raise HTTPException(status_code=404, detail="page out of range")
-    zoom = max(0.5, min(3.0, zoom))
-    doc = fitz.open(stream=s["pdf_bytes"], filetype="pdf")
-    try:
-        page = doc[page_num - 1]
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-        png = pix.tobytes("png")
-    finally:
-        doc.close()
-    return Response(
-        content=png,
-        media_type="image/png",
-        headers={"Cache-Control": "private, max-age=600"},
-    )
