@@ -1872,8 +1872,10 @@ function renderEntities() {
       row.className = 'ent-row';
       row.style.setProperty('--i', idx++);
       row.dataset.entityId = ent.id;
+      row.dataset.firstOccId = ent.occurrences[0]?.id ?? '';
       const occCount = ent.occurrences.length;
-      const occList = ent.occurrences.map(occ => `
+      const hasOccurrenceList = occCount > 1;
+      const occList = hasOccurrenceList ? ent.occurrences.map(occ => `
         <div class="occ-row" data-occ-id="${occ.id}" data-page="${occ.page}">
           <label class="occ-cb-wrap" onclick="event.stopPropagation()">
             <input type="checkbox" class="occ-cb" data-occ-id="${occ.id}">
@@ -1884,7 +1886,7 @@ function renderEntities() {
           </div>
           <span class="page-pill">p.${occ.page}</span>
         </div>
-      `).join('');
+      `).join('') : '';
       const trailing = ent.label === 'MANUAL'
         ? `<button class="delete-btn" data-entity-id="${ent.id}" title="Remove this mark" onclick="event.stopPropagation()">
              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
@@ -1899,7 +1901,7 @@ function renderEntities() {
           <div class="text">${escapeHtml(ent.text)}</div>
           ${trailing}
         </div>
-        <div class="occ-list">${occList}</div>
+        ${hasOccurrenceList ? `<div class="occ-list">${occList}</div>` : ''}
       `;
       body.appendChild(row);
     }
@@ -1926,14 +1928,16 @@ function renderEntities() {
     row.querySelector('.ent-summary').addEventListener('click', e => {
       if (e.target.closest('.ent-cb-wrap')) return;
       if (e.target.closest('.delete-btn')) return;
-      row.classList.toggle('expanded');
-      // Jump to first occurrence of this entity if expanding.
-      if (row.classList.contains('expanded')) {
-        const firstOcc = row.querySelector('.occ-row');
-        if (firstOcc) {
-          const p = parseInt(firstOcc.dataset.page, 10);
-          if (p !== state.currentPage) goToPage(p);
-        }
+      const firstOccId = parseInt(row.dataset.firstOccId, 10);
+      const firstOcc = state.occById.get(firstOccId);
+      if (firstOcc) {
+        state.currentOccId = firstOccId;
+        if (firstOcc.page !== state.currentPage) goToPage(firstOcc.page);
+        else renderOverlay();
+        highlightOccRow(firstOccId);
+      }
+      if (row.querySelector('.occ-list')) {
+        row.classList.toggle('expanded');
       }
     });
   }
@@ -2070,16 +2074,21 @@ function setAll(on) {
 
 function highlightOccRow(occId) {
   for (const row of entitiesEl.querySelectorAll('.occ-row.active')) row.classList.remove('active');
+  for (const row of entitiesEl.querySelectorAll('.ent-row.has-current')) row.classList.remove('has-current');
   const target = entitiesEl.querySelector('.occ-row[data-occ-id="' + occId + '"]');
   if (target) {
     target.classList.add('active');
     target.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    // Mark parent ent-row as having current.
-    for (const row of entitiesEl.querySelectorAll('.ent-row.has-current')) row.classList.remove('has-current');
     const entRow = target.closest('.ent-row');
     if (entRow) {
       entRow.classList.add('has-current', 'expanded');
     }
+    return;
+  }
+  const entRow = entitiesEl.querySelector('.ent-row[data-first-occ-id="' + occId + '"]');
+  if (entRow) {
+    entRow.classList.add('has-current');
+    entRow.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
 }
 
