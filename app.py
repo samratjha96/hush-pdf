@@ -931,7 +931,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="left-col">
     <div class="kicker">private PDF cleanup</div>
     <h1>The PDF stays<br>on your laptop.</h1>
-    <p class="lead">Find names, addresses, emails, phone numbers, account details, and other sensitive text before you share a PDF. No Epstein-files-style black-box theater.</p>
+    <p class="lead">Don’t get caught in your own Epstein files redaction fiasco.</p>
     <ul class="promises">
       <li><span class="pmark"></span><div><b id="promise-1-title">Nothing leaves this machine.</b> <span id="promise-1-body">Your PDF is checked here, never in the cloud.</span></div></li>
       <li><span class="pmark"></span><div><b>The Epstein-files lesson.</b> A black rectangle is not privacy if copy-paste can still find the text underneath.</div></li>
