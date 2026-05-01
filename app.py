@@ -1872,10 +1872,8 @@ function renderEntities() {
       row.className = 'ent-row';
       row.style.setProperty('--i', idx++);
       row.dataset.entityId = ent.id;
-      row.dataset.firstOccId = ent.occurrences[0]?.id ?? '';
       const occCount = ent.occurrences.length;
-      const hasOccurrenceList = occCount > 1;
-      const occList = hasOccurrenceList ? ent.occurrences.map(occ => `
+      const occList = ent.occurrences.map(occ => `
         <div class="occ-row" data-occ-id="${occ.id}" data-page="${occ.page}">
           <label class="occ-cb-wrap" onclick="event.stopPropagation()">
             <input type="checkbox" class="occ-cb" data-occ-id="${occ.id}">
@@ -1886,7 +1884,7 @@ function renderEntities() {
           </div>
           <span class="page-pill">p.${occ.page}</span>
         </div>
-      `).join('') : '';
+      `).join('');
       const trailing = ent.label === 'MANUAL'
         ? `<button class="delete-btn" data-entity-id="${ent.id}" title="Remove this mark" onclick="event.stopPropagation()">
              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
@@ -1901,7 +1899,7 @@ function renderEntities() {
           <div class="text">${escapeHtml(ent.text)}</div>
           ${trailing}
         </div>
-        ${hasOccurrenceList ? `<div class="occ-list">${occList}</div>` : ''}
+        <div class="occ-list">${occList}</div>
       `;
       body.appendChild(row);
     }
@@ -1928,16 +1926,14 @@ function renderEntities() {
     row.querySelector('.ent-summary').addEventListener('click', e => {
       if (e.target.closest('.ent-cb-wrap')) return;
       if (e.target.closest('.delete-btn')) return;
-      const firstOccId = parseInt(row.dataset.firstOccId, 10);
-      const firstOcc = state.occById.get(firstOccId);
-      if (firstOcc) {
-        state.currentOccId = firstOccId;
-        if (firstOcc.page !== state.currentPage) goToPage(firstOcc.page);
-        else renderOverlay();
-        highlightOccRow(firstOccId);
-      }
-      if (row.querySelector('.occ-list')) {
-        row.classList.toggle('expanded');
+      row.classList.toggle('expanded');
+      // Jump to first occurrence of this entity if expanding.
+      if (row.classList.contains('expanded')) {
+        const firstOcc = row.querySelector('.occ-row');
+        if (firstOcc) {
+          const p = parseInt(firstOcc.dataset.page, 10);
+          if (p !== state.currentPage) goToPage(p);
+        }
       }
     });
   }
@@ -2074,21 +2070,16 @@ function setAll(on) {
 
 function highlightOccRow(occId) {
   for (const row of entitiesEl.querySelectorAll('.occ-row.active')) row.classList.remove('active');
-  for (const row of entitiesEl.querySelectorAll('.ent-row.has-current')) row.classList.remove('has-current');
   const target = entitiesEl.querySelector('.occ-row[data-occ-id="' + occId + '"]');
   if (target) {
     target.classList.add('active');
     target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    // Mark parent ent-row as having current.
+    for (const row of entitiesEl.querySelectorAll('.ent-row.has-current')) row.classList.remove('has-current');
     const entRow = target.closest('.ent-row');
     if (entRow) {
       entRow.classList.add('has-current', 'expanded');
     }
-    return;
-  }
-  const entRow = entitiesEl.querySelector('.ent-row[data-first-occ-id="' + occId + '"]');
-  if (entRow) {
-    entRow.classList.add('has-current');
-    entRow.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
 }
 
@@ -2309,7 +2300,42 @@ function cancelMarkDrag() {
   state.markDrag = null;
 }
 
+function rectArea(rect) {
+  return Math.max(0, rect[2] - rect[0]) * Math.max(0, rect[3] - rect[1]);
+}
+
+function rectOverlapRatio(a, b) {
+  const x0 = Math.max(a[0], b[0]);
+  const y0 = Math.max(a[1], b[1]);
+  const x1 = Math.min(a[2], b[2]);
+  const y1 = Math.min(a[3], b[3]);
+  const overlap = rectArea([x0, y0, x1, y1]);
+  const smaller = Math.min(rectArea(a), rectArea(b));
+  return smaller > 0 ? overlap / smaller : 0;
+}
+
+function findDuplicateManualOccurrence(page, rect) {
+  for (const ent of state.session.entities) {
+    if (ent.label !== 'MANUAL') continue;
+    for (const occ of ent.occurrences) {
+      if (occ.page === page && rectOverlapRatio(occ.rect, rect) >= 0.8) return occ.id;
+    }
+  }
+  return null;
+}
+
 async function commitMark(rect) {
+  const existingOccId = findDuplicateManualOccurrence(state.currentPage, rect);
+  if (existingOccId != null) {
+    state.checkedOcc.add(existingOccId);
+    state.currentOccId = existingOccId;
+    renderEntities();
+    updateSummary();
+    renderOverlay();
+    highlightOccRow(existingOccId);
+    return;
+  }
+
   let entity;
   try {
     entity = await engine.mark(state.session.session_id, state.currentPage, rect);
