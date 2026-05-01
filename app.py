@@ -341,6 +341,19 @@ INDEX_HTML = r"""<!doctype html>
     pointer-events: none;
   }
   .drop-card.over { transform: translateY(-2px); border-color: var(--ink); }
+  .drop-card.unsupported {
+    border-color: #fecaca;
+    box-shadow: 0 4px 12px -6px rgba(153,27,27,0.18), 0 32px 60px -28px rgba(153,27,27,0.22);
+  }
+  .drop-card.unsupported .drop-zone {
+    cursor: not-allowed;
+    opacity: 0.68;
+  }
+  .drop-card.unsupported .drop-icon {
+    color: var(--err-fg);
+    border-color: #fecaca;
+    background: var(--err-bg);
+  }
   .drop-card .drop-zone {
     border: 0;
     border-radius: 18px;
@@ -382,11 +395,29 @@ INDEX_HTML = r"""<!doctype html>
     display: flex; align-items: center; gap: 12px;
   }
   .status.error { background: var(--err-bg); border-color: #fecaca; color: var(--err-fg); }
+  .status.error .status-help {
+    margin: 8px 0 0; padding-left: 18px;
+    color: var(--err-fg); opacity: 0.9;
+  }
+  .status.error .status-help li { margin: 3px 0; }
+  .status.notice {
+    background: #fff7ed;
+    border-color: #fed7aa;
+    color: #9a3412;
+  }
+  .status.notice .status-help {
+    margin: 8px 0 0; padding-left: 18px;
+    color: #9a3412; opacity: 0.9;
+  }
+  .status.notice .status-help li { margin: 3px 0; }
   .spinner {
     width: 14px; height: 14px; flex: none;
     border-radius: 999px;
-    border: 1.5px solid rgba(24,24,27,0.18);
-    border-top-color: var(--ink);
+    border: 0;
+    background: conic-gradient(from 0deg, transparent 0 230deg, currentColor 230deg 360deg);
+    color: var(--ink);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0);
+    mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0);
     animation: spin 720ms linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -900,10 +931,10 @@ INDEX_HTML = r"""<!doctype html>
   <div class="left-col">
     <div class="kicker">private PDF cleanup</div>
     <h1>The PDF stays<br>on your laptop.</h1>
-    <p class="lead">Find names, addresses, emails, phone numbers, account details, and other sensitive text before you share a PDF.</p>
+    <p class="lead">Find names, addresses, emails, phone numbers, account details, and other sensitive text before you share a PDF. No Epstein-files-style black-box theater.</p>
     <ul class="promises">
       <li><span class="pmark"></span><div><b id="promise-1-title">Nothing leaves this machine.</b> <span id="promise-1-body">Your PDF is checked here, never in the cloud.</span></div></li>
-      <li><span class="pmark"></span><div><b>Real removal.</b> Selected text is removed from the PDF, not just covered up.</div></li>
+      <li><span class="pmark"></span><div><b>The Epstein-files lesson.</b> A black rectangle is not privacy if copy-paste can still find the text underneath.</div></li>
       <li><span class="pmark"></span><div><b>You're in control.</b> Review every find, keep what belongs, and remove the rest.</div></li>
     </ul>
   </div>
@@ -1012,6 +1043,7 @@ INDEX_HTML = r"""<!doctype html>
 <script type="module">
 const $ = id => document.getElementById(id);
 const TICK_SVG = '<svg class="tick" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+const HUSH_BROWSER_ONLY = globalThis.__HUSH_BROWSER_ONLY__ === true;
 
 // ============================================================
 //  ENGINE ABSTRACTION
@@ -1109,7 +1141,11 @@ const MODEL_MIN_SCORE = 0.75;
 
 async function _loadMupdf() {
   if (_mupdf) return _mupdf;
-  _mupdf = await import(MUPDF_URL);
+  try {
+    _mupdf = await import(MUPDF_URL);
+  } catch (err) {
+    throw new Error('Could not load the private PDF reader. Check that this browser can reach cdn.jsdelivr.net, then reload the page.');
+  }
   return _mupdf;
 }
 
@@ -1117,7 +1153,13 @@ async function _loadClassifier(progressCb) {
   if (_classifier) return _classifier;
   if (_classifierLoading) return _classifierLoading;
   _classifierLoading = (async () => {
-    const tf = await import(TRANSFORMERS_URL);
+    let tf;
+    try {
+      tf = await import(TRANSFORMERS_URL);
+    } catch (err) {
+      _classifierLoading = null;
+      throw new Error('Could not load the private checker. Check that this browser can reach cdn.jsdelivr.net, then reload the page.');
+    }
     const tracker = {};
     const wrapped = data => {
       if (!progressCb) return;
@@ -1130,11 +1172,20 @@ async function _loadClassifier(progressCb) {
         progressCb({ phase: 'ready', percent: 100 });
       }
     };
-    const clf = await tf.pipeline('token-classification', 'openai/privacy-filter', {
-      device: 'webgpu',
-      dtype: 'q4',
-      progress_callback: wrapped,
-    });
+    let clf;
+    try {
+      clf = await tf.pipeline('token-classification', 'openai/privacy-filter', {
+        device: 'webgpu',
+        dtype: 'q4',
+        progress_callback: wrapped,
+      });
+    } catch (err) {
+      _classifierLoading = null;
+      if (String(err && err.message || err).includes('fetch')) {
+        throw new Error('Could not download the private checker. A browser setting, VPN, firewall, or company network may be blocking the model files from Hugging Face.');
+      }
+      throw new Error('Could not start the private checker. Make sure WebGPU is enabled in Chrome or Edge, then reload the page.');
+    }
     _classifier = clf;
     _classifierLoading = null;
     return clf;
@@ -1203,6 +1254,26 @@ function _snippetLocal(text, lo, hi, pad = 80) {
   return { before, match, after };
 }
 
+function _looksLikeCompactPrivateSpan(label, value, rect, pageDim) {
+  const clean = value.replace(/\s+/g, ' ').trim();
+  if (clean.length < 3 || clean.length > 180) return false;
+  if (clean.split(/\s+/).length > 12) return false;
+  if (/[.!?]\s+\S/.test(clean)) return false;
+  if (clean.includes('\n')) return false;
+
+  const [x0, y0, x1, y1] = rect;
+  const rectArea = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+  const pageArea = Math.max(1, pageDim.w * pageDim.h);
+  if (rectArea / pageArea > 0.08) return false;
+  if ((x1 - x0) / Math.max(1, pageDim.w) > 0.75) return false;
+  if ((y1 - y0) / Math.max(1, pageDim.h) > 0.12) return false;
+
+  if (label === 'PRIVATE_EMAIL') return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean);
+  if (label === 'PRIVATE_URL') return !/\s/.test(clean);
+  if (label === 'PRIVATE_PHONE') return clean.replace(/\D/g, '').length >= 7;
+  return true;
+}
+
 function _newSessionId() {
   const buf = new Uint8Array(12);
   crypto.getRandomValues(buf);
@@ -1247,7 +1318,8 @@ const BrowserEngine = {
       emit({ kind: 'page', i: i + 1, total: pageCount });
       const page = doc.loadPage(i);
       const bb = page.getBounds();
-      pageDims.push({ w: bb[2] - bb[0], h: bb[3] - bb[1] });
+      const pageDim = { w: bb[2] - bb[0], h: bb[3] - bb[1] };
+      pageDims.push(pageDim);
 
       const stext = page.toStructuredText('preserve-whitespace');
       const { text, bboxes } = _extractTextWithBboxes(stext);
@@ -1265,6 +1337,7 @@ const BrowserEngine = {
         if (!rect) continue;
         const word = text.slice(e.start, e.end).trim();
         if (!word) continue;
+        if (!_looksLikeCompactPrivateSpan(label, word, rect, pageDim)) continue;
         const key = label + '\x00' + word.toLowerCase();
         let rec = entitiesByKey.get(key);
         if (!rec) {
@@ -1391,6 +1464,21 @@ const BrowserEngine = {
   },
 };
 
+const UnsupportedEngine = {
+  id: 'unsupported',
+  label: 'WebGPU needed',
+  needsModelLoad: false,
+  isReady: false,
+  async preload() {},
+  async detect() {
+    throw new Error('WEBGPU_UNAVAILABLE');
+  },
+  async pageUrl() { throw new Error('WebGPU is required.'); },
+  async redact() { throw new Error('WebGPU is required.'); },
+  async mark() { throw new Error('WebGPU is required.'); },
+  async deleteEntity() { throw new Error('WebGPU is required.'); },
+};
+
 function setEnginePill(engineId, label) {
   const pill = $('engine-pill');
   if (!pill) return;
@@ -1415,6 +1503,9 @@ function engineTooltip(engineId) {
     const toggle = window.__browserCapable ? '\nClick to check inside the browser tab instead.' : '';
     return `Your PDF is checked by the app running on this device. No cloud upload.${toggle}`;
   }
+  if (engineId === 'unsupported') {
+    return 'Hush PDF needs WebGPU so it can check PDFs privately in your browser. Use current Chrome or Edge with hardware acceleration enabled.';
+  }
   return '';
 }
 
@@ -1430,10 +1521,40 @@ function setPromiseCopy(engineId) {
     if (dropIo) dropIo.textContent = 'removes selected text from the PDF';
   } else {
     if (title) title.textContent = 'Nothing leaves this machine.';
-    if (body) body.textContent = 'Your PDF is checked by the app on this device, never in the cloud.';
-    if (dropInf) dropInf.textContent = 'stays on this device';
-    if (dropIo) dropIo.textContent = 'removes selected text from the PDF';
+    if (engineId === 'unsupported') {
+      if (body) body.textContent = 'Use current Chrome or Edge with WebGPU enabled to check PDFs privately on this device.';
+      if (dropInf) dropInf.textContent = 'requires WebGPU';
+      if (dropIo) dropIo.textContent = 'no cloud fallback';
+    } else {
+      if (body) body.textContent = 'Your PDF is checked by the app on this device, never in the cloud.';
+      if (dropInf) dropInf.textContent = 'stays on this device';
+      if (dropIo) dropIo.textContent = 'removes selected text from the PDF';
+    }
   }
+}
+
+function webGpuHelpList() {
+  return '<ol class="status-help">' +
+    '<li>Use the latest Chrome or Microsoft Edge.</li>' +
+    '<li>Turn on hardware acceleration in browser settings.</li>' +
+    '<li>Update your graphics driver, then fully restart the browser.</li>' +
+    '<li>If you are in Remote Desktop, a VM, or a managed work browser, try a normal local browser session.</li>' +
+    '<li>Open <span class="mono">chrome://gpu</span> or <span class="mono">edge://gpu</span> and check that WebGPU is available.</li>' +
+  '</ol>';
+}
+
+function showWebGpuUnavailableNotice() {
+  dropCard.classList.add('unsupported');
+  fileInput.disabled = true;
+  dropZone.setAttribute('aria-disabled', 'true');
+  uploadStatus.innerHTML =
+    '<div class="status notice">' +
+      '<div class="status-body">' +
+        '<div class="status-line"><b>Private checking needs WebGPU.</b></div>' +
+        '<div class="status-sub">Hush PDF keeps your document in the browser, so this device needs browser GPU support before you choose a PDF.</div>' +
+        webGpuHelpList() +
+      '</div>' +
+    '</div>';
 }
 
 const ENGINE_MIN_BUFFER_MB = 1024;
@@ -1450,6 +1571,7 @@ function writeEnginePref(v) {
 }
 
 function pickEngine(forceId) {
+  if (HUSH_BROWSER_ONLY) return browserCapable ? BrowserEngine : UnsupportedEngine;
   if (forceId === 'browser' && browserCapable) return BrowserEngine;
   return ServerEngine;
 }
@@ -1463,6 +1585,7 @@ window.__ServerEngine = ServerEngine;
 window.__browserCapable = browserCapable;
 
 function switchEngine(id) {
+  if (HUSH_BROWSER_ONLY) return engine.id === 'browser';
   const next = id === 'browser' ? (browserCapable ? BrowserEngine : null) : ServerEngine;
   if (!next) return false;
   if (next.id === engine.id) return true;
@@ -1479,8 +1602,9 @@ window.switchEngine = switchEngine;
 let _detectInFlight = false;
 const enginePillEl = $('engine-pill');
 if (enginePillEl) {
-  enginePillEl.style.cursor = browserCapable ? 'pointer' : 'help';
+  enginePillEl.style.cursor = HUSH_BROWSER_ONLY ? 'help' : (browserCapable ? 'pointer' : 'help');
   enginePillEl.addEventListener('click', () => {
+    if (HUSH_BROWSER_ONLY) return;
     if (!browserCapable) return;
     if (_detectInFlight) return;
     const review = $('stage-review');
@@ -1495,6 +1619,7 @@ const uploadStatus = $('upload-status');
 const entitiesEl = $('entities');
 const pageImg = $('page-img'), overlayEl = $('overlay'), canvasEl = $('canvas');
 const pageInput = $('page-input'), pageTotalEl = $('page-total');
+if (engine.id === 'unsupported') showWebGpuUnavailableNotice();
 
 const state = {
   session: null,
@@ -1626,6 +1751,33 @@ function renderUploadStatus(u, fname) {
   renderStatusPanel({ lineHtml: escapeHtml(u.text || '') });
 }
 
+function showUploadError(err) {
+  const raw = String(err && err.message ? err.message : err || 'Something went wrong.');
+  let msg = raw;
+  let help = '';
+  if (raw === 'WEBGPU_UNAVAILABLE' || raw.includes('WebGPU is required')) {
+    msg = 'This browser cannot use WebGPU right now, so Hush PDF cannot check the file privately in the browser.';
+    help = webGpuHelpList();
+  }
+  if (raw === 'Failed to fetch' || raw.includes('Importing a module script failed')) {
+    msg = 'Could not download the private checker. A browser setting, VPN, firewall, or company network may be blocking the files needed to run privately in this browser.';
+    help =
+      '<ol class="status-help">' +
+        '<li>Try the latest Chrome or Microsoft Edge outside a VPN or strict company network.</li>' +
+        '<li>Allow access to <span class="mono">cdn.jsdelivr.net</span> and <span class="mono">huggingface.co</span>.</li>' +
+        '<li>Reload the page after changing network or browser settings.</li>' +
+      '</ol>';
+  }
+  uploadStatus.innerHTML =
+    '<div class="status error">' +
+      '<div class="status-body">' +
+        '<div class="status-line"><b>Could not check this PDF privately.</b></div>' +
+        '<div class="status-sub">' + escapeHtml(msg) + '</div>' +
+        help +
+      '</div>' +
+    '</div>';
+}
+
 async function detect(file) {
   state.fileName = file.name;
   const t0 = performance.now();
@@ -1635,7 +1787,7 @@ async function detect(file) {
   try {
     state.session = await engine.detect(file, u => renderUploadStatus(u, file.name));
   } catch (err) {
-    uploadStatus.innerHTML = '<div class="status error">' + escapeHtml(err.message) + '</div>';
+    showUploadError(err);
     return;
   } finally {
     _detectInFlight = false;
@@ -2196,7 +2348,7 @@ async function applyRedactions() {
   $('apply-error').classList.add('hidden');
   const btn = $('apply-btn');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner" style="border-color: rgba(255,255,255,0.4); border-top-color: #fff; width: 12px; height: 12px;"></span>&nbsp;Applying';
+  btn.innerHTML = '<span class="spinner" style="color: #fff; width: 12px; height: 12px;"></span>&nbsp;Applying';
   let blob;
   try {
     blob = await engine.redact(state.session.session_id, accepted);
