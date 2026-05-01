@@ -18,6 +18,12 @@ python3 -m http.server 8765
 
 Then open `http://127.0.0.1:8765`.
 
+## Test
+
+```bash
+node tests/detection-rules.test.mjs
+```
+
 ## Browser Requirements
 
 Hush PDF needs WebGPU so the private checker can run locally in the browser.
