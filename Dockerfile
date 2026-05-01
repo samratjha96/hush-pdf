@@ -8,8 +8,7 @@ ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
     UV_PYTHON_DOWNLOADS=never \
     UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
-    UV_INDEX_STRATEGY=unsafe-best-match \
-    HF_HOME=/opt/hf-cache
+    UV_INDEX_STRATEGY=unsafe-best-match
 
 WORKDIR /app
 
@@ -17,8 +16,6 @@ COPY pyproject.toml uv.lock ./
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --no-dev
-
-RUN uv run --no-sync python -c "from huggingface_hub import snapshot_download; snapshot_download('openai/privacy-filter')"
 
 
 FROM python:3.12-slim AS runtime
@@ -38,15 +35,12 @@ RUN groupadd --system --gid 1001 hush \
 WORKDIR /app
 
 COPY --from=builder --chown=hush:hush /app/.venv /app/.venv
-COPY --from=builder --chown=hush:hush /opt/hf-cache /opt/hf-cache
 COPY --chown=hush:hush app.py ./
 COPY --chown=hush:hush assets/ ./assets/
 COPY --chown=hush:hush probe/ ./probe/
 
 ENV PATH="/app/.venv/bin:$PATH" \
-    HF_HOME=/opt/hf-cache \
-    HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
+    HF_HOME=/tmp/hf-cache \
     PYTHONUNBUFFERED=1 \
     HUSH_SESSION_TTL_SECONDS=900 \
     npm_config_cache=/tmp/.npm \

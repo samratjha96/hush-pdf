@@ -26,6 +26,7 @@ from transformers import pipeline
 classifier = None
 device_in_use: str = "cpu"
 INFERENCE_BATCH_SIZE = 4
+MODEL_MIN_SCORE = 0.75
 
 SESSIONS: dict[str, dict] = {}
 SESSION_TTL_SECONDS = int(os.environ.get("HUSH_SESSION_TTL_SECONDS", "900"))
@@ -156,7 +157,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Redactor — local PDF privacy</title>
+<title>Hush PDF — private PDF cleanup</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -286,7 +287,7 @@ INDEX_HTML = r"""<!doctype html>
   }
   .upload-shell .right-col {
     padding: 64px 64px 64px 0;
-    display: flex; align-items: center; justify-content: center;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
   }
   .kicker {
     font-size: 11px; font-weight: 500; letter-spacing: 0.16em; text-transform: uppercase;
@@ -341,16 +342,16 @@ INDEX_HTML = r"""<!doctype html>
   }
   .drop-card.over { transform: translateY(-2px); border-color: var(--ink); }
   .drop-card .drop-zone {
-    border: 1.5px dashed var(--line-strong);
+    border: 0;
     border-radius: 18px;
     padding: 56px 20px;
     text-align: center;
     cursor: pointer;
-    transition: border-color 160ms var(--ease), background 160ms var(--ease);
+    transition: background 160ms var(--ease);
     position: relative;
   }
-  .drop-card .drop-zone:hover { border-color: var(--ink); background: rgba(24,24,27,0.025); }
-  .drop-card.over .drop-zone { border-color: var(--ink); background: rgba(24,24,27,0.04); }
+  .drop-card .drop-zone:hover { background: transparent; }
+  .drop-card.over .drop-zone { background: transparent; }
   .drop-card input[type=file] { display: none; }
   .drop-icon {
     width: 38px; height: 38px; margin: 0 auto 16px;
@@ -372,7 +373,7 @@ INDEX_HTML = r"""<!doctype html>
   }
   .drop-meta b { display: block; color: var(--ink); font-weight: 500; font-size: 12.5px; margin-bottom: 2px; letter-spacing: -0.005em; }
 
-  .upload-status { margin-top: 22px; }
+  .upload-status { width: 100%; max-width: 480px; margin-top: 18px; }
   .status {
     padding: 14px 16px; border-radius: 12px;
     background: var(--panel); border: 1px solid var(--line);
@@ -883,12 +884,12 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 
 <div class="topbar">
-  <div class="brand"><span class="dot"></span> redactor</div>
+  <div class="brand"><span class="dot"></span> Hush PDF</div>
   <div class="meta" id="topmeta"></div>
   <div class="engine-slot">
     <span class="engine-pill" id="engine-pill" data-engine-id="loading" title="Where detection runs">
       <span class="engine-pill-dot" aria-hidden="true"></span>
-      <span class="engine-pill-text">checking device</span>
+      <span class="engine-pill-text">private mode</span>
     </span>
   </div>
   <div class="right" id="topactions"></div>
@@ -897,13 +898,13 @@ INDEX_HTML = r"""<!doctype html>
 <!-- ==================== UPLOAD STAGE ==================== -->
 <section id="stage-upload" class="upload-shell">
   <div class="left-col">
-    <div class="kicker">local-only PII redaction</div>
+    <div class="kicker">private PDF cleanup</div>
     <h1>The PDF stays<br>on your laptop.</h1>
-    <p class="lead">Names, addresses, emails, account numbers, and secrets — flagged in place. You decide what gets removed from the underlying text layer.</p>
+    <p class="lead">Find names, addresses, emails, phone numbers, account details, and other sensitive text before you share a PDF.</p>
     <ul class="promises">
-      <li><span class="pmark"></span><div><b id="promise-1-title">Nothing leaves this machine.</b> <span id="promise-1-body">Inference runs on this device, never the cloud.</span></div></li>
-      <li><span class="pmark"></span><div><b>Real text deletion.</b> Redactions strip the bytes — not just paint over them with black rectangles.</div></li>
-      <li><span class="pmark"></span><div><b>You're the editor.</b> Every candidate is shown in context. You confirm one by one, or in bulk.</div></li>
+      <li><span class="pmark"></span><div><b id="promise-1-title">Nothing leaves this machine.</b> <span id="promise-1-body">Your PDF is checked here, never in the cloud.</span></div></li>
+      <li><span class="pmark"></span><div><b>Real removal.</b> Selected text is removed from the PDF, not just covered up.</div></li>
+      <li><span class="pmark"></span><div><b>You're in control.</b> Review every find, keep what belongs, and remove the rest.</div></li>
     </ul>
   </div>
   <div class="right-col">
@@ -917,15 +918,15 @@ INDEX_HTML = r"""<!doctype html>
         <div class="drop-sub">Up to a few hundred pages</div>
       </label>
       <div class="drop-meta">
-        <div><b>Model</b>openai/privacy-filter</div>
-        <div><b>Categories</b>person, address, email, phone, url, date, account, secret</div>
-        <div><b>Inference</b><span id="drop-meta-inference">checking device…</span></div>
-        <div><b>PDF I/O</b><span id="drop-meta-io">checking device…</span></div>
+        <div><b>Privacy</b><span id="drop-meta-inference">stays on this device</span></div>
+        <div><b>Looks for</b>names, addresses, emails, phone numbers, links, dates, accounts, secrets</div>
+        <div><b>Review</b>everything found is selected first</div>
+        <div><b>Result</b><span id="drop-meta-io">removes selected text from the PDF</span></div>
       </div>
     </div>
+    <div id="upload-status" class="upload-status"></div>
   </div>
 </section>
-<div id="upload-status" class="upload-status" style="padding: 0 64px 40px;"></div>
 
 <!-- ==================== REVIEW STAGE ==================== -->
 <section id="stage-review" class="review-shell hidden">
@@ -933,7 +934,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="pane-head">
       <div class="summary">
         <div>
-          <div class="label">candidates marked</div>
+          <div class="label">selected for removal</div>
           <div class="count"><span id="checked-count">0</span><span class="of">/<span id="total-count">0</span></span></div>
         </div>
         <div>
@@ -958,11 +959,11 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
       <div class="head-right">
-        <button class="tool-btn" id="preview-toggle" title="Preview the redacted output (P)">
+        <button class="tool-btn" id="preview-toggle" title="Preview the cleaned PDF (P)">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
           Preview<span class="kbd">P</span>
         </button>
-        <button class="tool-btn" id="mark-toggle" title="Mark a region for redaction (M)">
+        <button class="tool-btn" id="mark-toggle" title="Mark an area to remove (M)">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h6v6H3z"/><path d="M15 15h6v6h-6z"/><path d="M9 9l6 6"/></svg>
           Mark area<span class="kbd">M</span>
         </button>
@@ -995,15 +996,15 @@ INDEX_HTML = r"""<!doctype html>
     <div class="seal" aria-hidden="true">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
     </div>
-    <h2 id="done-title">Redacted.</h2>
-    <p class="sub" id="done-sub">Underlying text was deleted from the PDF. The original never left this machine.</p>
+    <h2 id="done-title">Cleaned.</h2>
+    <p class="sub" id="done-sub">Selected text was removed from the PDF. The original never left this machine.</p>
     <ul class="done-summary" id="done-summary"></ul>
     <div class="done-actions">
       <a class="download-btn" id="download-link" download="">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-        Download redacted PDF
+        Download cleaned PDF
       </a>
-      <button class="ghost" id="redact-another">Redact another</button>
+      <button class="ghost" id="redact-another">Clean another</button>
     </div>
   </div>
 </section>
@@ -1053,13 +1054,13 @@ async function _formatErr(r) {
 
 const ServerEngine = {
   id: 'server',
-  label: 'local backend',
+  label: 'on this device',
   needsModelLoad: false,
   isReady: true,
   async preload() {},
   async detect(file, progressCb) {
     const emit = (u) => { if (progressCb) progressCb(typeof u === 'string' ? { kind: 'msg', text: u } : u); };
-    emit({ kind: 'msg', text: 'uploading to local backend on 127.0.0.1…' });
+    emit({ kind: 'msg', text: 'checking privately on this device…' });
     const fd = new FormData();
     fd.append('pdf', file);
     const r = await fetch('/api/detect', { method: 'POST', body: fd });
@@ -1104,6 +1105,7 @@ let _mupdf = null;
 let _classifier = null;
 let _classifierLoading = null;
 const _bSessions = new Map();
+const MODEL_MIN_SCORE = 0.75;
 
 async function _loadMupdf() {
   if (_mupdf) return _mupdf;
@@ -1223,7 +1225,7 @@ const BrowserEngine = {
     emit({ kind: 'msg', text: 'opening PDF…' });
     const mupdf = await _loadMupdf();
     if (!_classifier) {
-      emit({ kind: 'msg', text: 'first run: downloading detection model (~800 MB). Cached locally for next time.' });
+      emit({ kind: 'msg', text: 'first run: getting the private checker ready. Saved on this device for next time.' });
       await _loadClassifier(p => {
         if (p.phase === 'download') {
           emit({ kind: 'download', percent: p.percent, files: p.files });
@@ -1257,6 +1259,7 @@ const BrowserEngine = {
       for (const e of ents) {
         const label = (e.entity_group || e.entity || '').toUpperCase();
         if (!label) continue;
+        if (Number(e.score ?? 1) < MODEL_MIN_SCORE) continue;
         const span = bboxes.slice(e.start, e.end);
         const rect = _bboxUnion(span);
         if (!rect) continue;
@@ -1403,18 +1406,14 @@ function formatGpuLabel(fallback) {
 }
 
 function engineTooltip(engineId) {
-  if (engineId === 'loading') return 'Checking device capabilities…';
-  const c = window.__caps || {};
-  const gpu = formatGpuLabel('GPU');
-  const buf = c.maxBufferMB ? `${c.maxBufferMB} MB buffer` : '';
-  const capLine = c.webgpu ? `WebGPU: ${gpu}${buf ? ' · ' + buf : ''}` : 'WebGPU not available on this device';
+  if (engineId === 'loading') return 'Checking this device…';
   if (engineId === 'browser') {
-    const toggle = window.__browserCapable ? '\nClick to switch to local backend.' : '';
-    return `Detection runs in this browser tab. The PDF never leaves this device.\n${capLine}${toggle}`;
+    const toggle = window.__browserCapable ? '\nClick to use the device app instead.' : '';
+    return `Your PDF is checked in this browser tab and never leaves this device.${toggle}`;
   }
   if (engineId === 'server') {
-    const toggle = window.__browserCapable ? '\nClick to switch to in-browser inference.' : '\nThis device cannot run the model in-browser.';
-    return `Detection runs on the local FastAPI backend on 127.0.0.1.\n${capLine}${toggle}`;
+    const toggle = window.__browserCapable ? '\nClick to check inside the browser tab instead.' : '';
+    return `Your PDF is checked by the app running on this device. No cloud upload.${toggle}`;
   }
   return '';
 }
@@ -1424,17 +1423,16 @@ function setPromiseCopy(engineId) {
   const body = $('promise-1-body');
   const dropInf = $('drop-meta-inference');
   const dropIo = $('drop-meta-io');
-  const gpu = formatGpuLabel('this device');
   if (engineId === 'browser') {
     if (title) title.textContent = 'Nothing leaves this browser tab.';
-    if (body) body.textContent = `Inference runs on ${gpu} via WebGPU. No upload, no server round-trip.`;
-    if (dropInf) dropInf.textContent = `${gpu} · WebGPU · q4`;
-    if (dropIo) dropIo.textContent = 'mupdf-wasm in this browser';
+    if (body) body.textContent = 'Your PDF is checked in this tab, without a cloud upload.';
+    if (dropInf) dropInf.textContent = 'stays in this browser tab';
+    if (dropIo) dropIo.textContent = 'removes selected text from the PDF';
   } else {
     if (title) title.textContent = 'Nothing leaves this machine.';
-    if (body) body.textContent = 'Inference runs on a local FastAPI backend on 127.0.0.1 — same laptop, no cloud.';
-    if (dropInf) dropInf.textContent = 'transformers (CPU) on 127.0.0.1';
-    if (dropIo) dropIo.textContent = 'pymupdf on 127.0.0.1';
+    if (body) body.textContent = 'Your PDF is checked by the app on this device, never in the cloud.';
+    if (dropInf) dropInf.textContent = 'stays on this device';
+    if (dropIo) dropIo.textContent = 'removes selected text from the PDF';
   }
 }
 
@@ -1452,11 +1450,8 @@ function writeEnginePref(v) {
 }
 
 function pickEngine(forceId) {
-  const pref = forceId || readEnginePref();
-  if (pref === 'server') return ServerEngine;
-  if (pref === 'browser' && browserCapable) return BrowserEngine;
-  // Default: browser when capable, server otherwise.
-  return browserCapable ? BrowserEngine : ServerEngine;
+  if (forceId === 'browser' && browserCapable) return BrowserEngine;
+  return ServerEngine;
 }
 
 let engine = pickEngine();
@@ -1560,7 +1555,7 @@ function show(stage) {
     const apply = document.createElement('button');
     apply.className = 'danger';
     apply.id = 'apply-btn';
-    apply.textContent = 'Apply redactions';
+    apply.textContent = 'Remove selected';
     apply.addEventListener('click', applyRedactions);
     const cancel = document.createElement('button');
     cancel.className = 'ghost';
@@ -1613,7 +1608,7 @@ function renderUploadStatus(u, fname) {
     const pct = Math.max(0, Math.min(100, Math.round(u.percent || 0)));
     const fileLabel = u.files ? `${u.files} file${u.files === 1 ? '' : 's'}` : '';
     renderStatusPanel({
-      lineHtml: 'Downloading detection model · first run only, then cached locally',
+      lineHtml: 'Getting the private checker ready · saved on this device for next time',
       sub: `${pct}% · ${fileLabel}`,
       percent: pct,
     });
@@ -1622,7 +1617,7 @@ function renderUploadStatus(u, fname) {
   if (u.kind === 'page') {
     const pct = u.total ? Math.round((u.i / u.total) * 100) : 0;
     renderStatusPanel({
-      lineHtml: `Analysing <span class="mono">${escapeHtml(fname || '')}</span>`,
+      lineHtml: `Checking <span class="mono">${escapeHtml(fname || '')}</span>`,
       sub: `page ${u.i} / ${u.total}`,
       percent: pct,
     });
@@ -1636,7 +1631,7 @@ async function detect(file) {
   const t0 = performance.now();
   _detectInFlight = true;
   document.body.classList.add('busy-detect');
-  renderUploadStatus({ kind: 'msg', text: 'Analyzing ' + file.name + ' · this can take 30 seconds to a few minutes.' });
+  renderUploadStatus({ kind: 'msg', text: 'Checking ' + file.name + ' · this can take 30 seconds to a few minutes.' });
   try {
     state.session = await engine.detect(file, u => renderUploadStatus(u, file.name));
   } catch (err) {
@@ -1903,7 +1898,7 @@ function updateSummary() {
   if (apply) {
     const hasSel = state.checkedOcc.size > 0;
     apply.disabled = !hasSel;
-    apply.title = hasSel ? '' : 'Select at least one candidate';
+    apply.title = hasSel ? '' : 'Select at least one item';
   }
 }
 
@@ -2183,19 +2178,19 @@ async function commitMark(rect) {
 function showApplyError(msg) {
   const el = $('apply-error');
   el.classList.remove('hidden');
-  el.innerHTML = '<div style="flex:1; min-width:0;"><div style="font-weight:600; margin-bottom:2px;">Could not apply redactions</div><div style="opacity:0.85;">' + escapeHtml(msg) + '</div></div><button class="x" type="button" aria-label="Dismiss">×</button>';
+  el.innerHTML = '<div style="flex:1; min-width:0;"><div style="font-weight:600; margin-bottom:2px;">Could not remove selected text</div><div style="opacity:0.85;">' + escapeHtml(msg) + '</div></div><button class="x" type="button" aria-label="Dismiss">×</button>';
   el.querySelector('.x').addEventListener('click', () => el.classList.add('hidden'));
 }
 
 function resetApplyButton() {
   const btn = $('apply-btn');
-  if (btn) { btn.disabled = false; btn.textContent = 'Apply redactions'; }
+  if (btn) { btn.disabled = false; btn.textContent = 'Remove selected'; }
 }
 
 async function applyRedactions() {
   const accepted = Array.from(state.checkedOcc);
   if (accepted.length === 0) {
-    showApplyError('Select at least one candidate to redact.');
+    showApplyError('Select at least one item to remove.');
     return;
   }
   $('apply-error').classList.add('hidden');
@@ -2224,7 +2219,7 @@ async function applyRedactions() {
   const labels = Object.keys(counts).sort();
   if (!labels.length) {
     const li = document.createElement('li');
-    li.innerHTML = '<span class="lbl">redactions</span><span class="val">0</span>';
+    li.innerHTML = '<span class="lbl">removed</span><span class="val">0</span>';
     ul.appendChild(li);
   }
   for (const k of labels) {
@@ -2239,12 +2234,10 @@ async function applyRedactions() {
 
   const dl = $('download-link');
   dl.href = url;
-  dl.download = 'redacted-' + state.fileName;
+  dl.download = 'cleaned-' + state.fileName;
   const sub = $('done-sub');
   if (sub) {
-    sub.textContent = engine.id === 'browser'
-      ? 'Underlying text was deleted from the PDF. The original never left this machine.'
-      : 'Underlying text was deleted by the local FastAPI backend and the redacted PDF is ready below.';
+    sub.textContent = 'Selected text was removed from the PDF. The original never left this machine.';
   }
   show('done');
 }
@@ -2303,6 +2296,8 @@ def regex_backstop(text: str) -> list[tuple[str, str]]:
 def entities_from_outputs(text: str, model_output: list[dict]) -> set[tuple[str, str]]:
     seen: set[tuple[str, str]] = set()
     for e in coalesce(model_output):
+        if float(e.get("score", 1.0)) < MODEL_MIN_SCORE:
+            continue
         label = (e.get("entity_group") or e.get("entity") or "").upper()
         if not label:
             continue

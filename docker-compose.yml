@@ -9,6 +9,8 @@ services:
     environment:
       HUSH_SESSION_TTL_SECONDS: "900"
     read_only: true
+    volumes:
+      - ${HOME}/.cache/huggingface:/tmp/hf-cache:ro
     tmpfs:
       - /tmp
     security_opt:
