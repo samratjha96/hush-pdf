@@ -1,158 +1,4 @@
-from __future__ import annotations
-
-import asyncio
-import io
-import json
-import os
-import re
-import secrets
-import subprocess
-import tempfile
-import time
-from collections import defaultdict
-from contextlib import asynccontextmanager
-
-# Allow MPS to fall back to CPU for ops it doesn't implement.
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-
-import fitz
-import torch
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from transformers import pipeline
-
-classifier = None
-device_in_use: str = "cpu"
-INFERENCE_BATCH_SIZE = 4
-MODEL_MIN_SCORE = 0.75
-
-SESSIONS: dict[str, dict] = {}
-SESSION_TTL_SECONDS = int(os.environ.get("HUSH_SESSION_TTL_SECONDS", "900"))
-SESSION_SWEEP_INTERVAL = 60
-
-EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-URL_RE = re.compile(
-    r"https?://[^\s)\]<>\"']+|\bwww\.[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:/[^\s)\]<>\"']*)?"
-)
-PHONE_RE = re.compile(
-    r"""(?x)
-    (?<!\w)(?<!\d)
-    (?:
-        \+\d{1,3}[\s.-]\d{1,4}[\s.-]\d{2,4}[\s.-]\d{2,4}(?:[\s.-]\d{2,4})?
-      | \(\d{3}\)\s?\d{3}[\s.-]\d{4}
-      | \d{3}[.\-]\d{3}[.\-]\d{4}
-      | \+\d{10,15}
-    )
-    (?!\d)(?!\w)
-    """
-)
-
-
-def _pick_device() -> str:
-    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        return "mps"
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global classifier, device_in_use
-    device = _pick_device()
-    print(f"Loading openai/privacy-filter on {device}...")
-    try:
-        classifier = pipeline(
-            task="token-classification",
-            model="openai/privacy-filter",
-            aggregation_strategy="simple",
-            device=device,
-        )
-        _ = classifier("warmup John Doe john@example.com")
-        device_in_use = device
-    except Exception as e:
-        if device != "cpu":
-            print(f"  {device} failed ({e}), falling back to cpu")
-            classifier = pipeline(
-                task="token-classification",
-                model="openai/privacy-filter",
-                aggregation_strategy="simple",
-                device="cpu",
-            )
-            device_in_use = "cpu"
-        else:
-            raise
-    print(f"Model ready on {device_in_use}.")
-
-    async def _sweep_loop() -> None:
-        while True:
-            await asyncio.sleep(SESSION_SWEEP_INTERVAL)
-            _gc_sessions()
-
-    sweeper = asyncio.create_task(_sweep_loop())
-    try:
-        yield
-    finally:
-        sweeper.cancel()
-        SESSIONS.clear()
-
-
-def _empty_device_cache() -> None:
-    if device_in_use == "mps":
-        try:
-            torch.mps.empty_cache()
-        except Exception:
-            pass
-    elif device_in_use == "cuda":
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-
-def _classify_batched(texts: list[str]) -> list[list[dict]]:
-    if not texts or classifier is None:
-        return [[] for _ in texts]
-    out: list[list[dict]] = []
-    for i in range(0, len(texts), INFERENCE_BATCH_SIZE):
-        chunk = texts[i : i + INFERENCE_BATCH_SIZE]
-        try:
-            r = classifier(chunk, batch_size=len(chunk))
-        except Exception as e:
-            print(f"  chunk {i}-{i+len(chunk)} failed on {device_in_use}: {e}; retrying per-item on cpu")
-            r = []
-            cpu_clf = pipeline(
-                task="token-classification",
-                model="openai/privacy-filter",
-                aggregation_strategy="simple",
-                device="cpu",
-            )
-            for t in chunk:
-                r.append(cpu_clf(t))
-        if r and isinstance(r, list) and r and isinstance(r[0], dict):
-            r = [r]
-        out.extend(r)
-        _empty_device_cache()
-    return out
-
-
-def _gc_sessions() -> None:
-    now = time.time()
-    expired = [k for k, v in SESSIONS.items() if now - v["created_at"] > SESSION_TTL_SECONDS]
-    for k in expired:
-        SESSIONS.pop(k, None)
-
-
-app = FastAPI(lifespan=lifespan)
-if os.path.isdir("assets"):
-    app.mount("/assets", StaticFiles(directory="assets"), name="assets")
-if os.path.isdir("probe"):
-    app.mount("/probe", StaticFiles(directory="probe", html=True), name="probe")
-
-
-INDEX_HTML = r"""<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -234,7 +80,6 @@ INDEX_HTML = r"""<!doctype html>
     transition: border-color 160ms var(--ease), background 160ms var(--ease);
   }
   .engine-pill[data-engine-id="browser"] { color: #047857; border-color: rgba(4, 120, 87, 0.25); background: rgba(4, 120, 87, 0.04); }
-  .engine-pill[data-engine-id="server"]  { color: #b45309; border-color: rgba(180, 83, 9, 0.28); background: rgba(180, 83, 9, 0.04); }
   .engine-pill[data-engine-id="loading"] { color: var(--muted); }
   .engine-pill-dot {
     width: 6px; height: 6px; border-radius: 50%; background: currentColor;
@@ -933,7 +778,7 @@ INDEX_HTML = r"""<!doctype html>
     <h1>The PDF stays<br>on your laptop.</h1>
     <p class="lead">Don’t get caught in your own Epstein files redaction fiasco.</p>
     <ul class="promises">
-      <li><span class="pmark"></span><div><b id="promise-1-title">Nothing leaves this machine.</b> <span id="promise-1-body">Your PDF is checked here, never in the cloud.</span></div></li>
+      <li><span class="pmark"></span><div><b id="promise-1-title">Nothing leaves this browser tab.</b> <span id="promise-1-body">Your PDF is checked in this tab, without a cloud upload.</span></div></li>
       <li><span class="pmark"></span><div><b>The Epstein-files lesson.</b> A black rectangle is not privacy if copy-paste can still find the text underneath.</div></li>
       <li><span class="pmark"></span><div><b>You're in control.</b> Review every find, keep what belongs, and remove the rest.</div></li>
     </ul>
@@ -949,7 +794,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="drop-sub">Up to a few hundred pages</div>
       </label>
       <div class="drop-meta">
-        <div><b>Privacy</b><span id="drop-meta-inference">stays on this device</span></div>
+        <div><b>Privacy</b><span id="drop-meta-inference">stays in this browser tab</span></div>
         <div><b>Looks for</b>names, addresses, emails, phone numbers, links, dates, accounts, secrets</div>
         <div><b>Review</b>everything found is selected first</div>
         <div><b>Result</b><span id="drop-meta-io">removes selected text from the PDF</span></div>
@@ -1028,7 +873,7 @@ INDEX_HTML = r"""<!doctype html>
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
     </div>
     <h2 id="done-title">Cleaned.</h2>
-    <p class="sub" id="done-sub">Selected text was removed from the PDF. The original never left this machine.</p>
+    <p class="sub" id="done-sub">Selected text was removed from the PDF. The original never left this browser tab.</p>
     <ul class="done-summary" id="done-summary"></ul>
     <div class="done-actions">
       <a class="download-btn" id="download-link" download="">
@@ -1043,12 +888,9 @@ INDEX_HTML = r"""<!doctype html>
 <script type="module">
 const $ = id => document.getElementById(id);
 const TICK_SVG = '<svg class="tick" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
-const HUSH_BROWSER_ONLY = globalThis.__HUSH_BROWSER_ONLY__ === true;
 
 // ============================================================
-//  ENGINE ABSTRACTION
-//  - server: classic POST /api/* roundtrip
-//  - browser: mupdf-wasm + transformers.js, no upload (TODO)
+//  Browser PDF engine: mupdf-wasm + Transformers.js/WebGPU.
 // ============================================================
 
 async function checkCaps() {
@@ -1076,59 +918,6 @@ async function checkCaps() {
   }
   return caps;
 }
-
-async function _formatErr(r) {
-  let detail = '';
-  try { detail = await r.text(); } catch { detail = r.statusText; }
-  try { const j = JSON.parse(detail); if (j && j.detail) detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); } catch {}
-  return detail || ('HTTP ' + r.status);
-}
-
-const ServerEngine = {
-  id: 'server',
-  label: 'on this device',
-  needsModelLoad: false,
-  isReady: true,
-  async preload() {},
-  async detect(file, progressCb) {
-    const emit = (u) => { if (progressCb) progressCb(typeof u === 'string' ? { kind: 'msg', text: u } : u); };
-    emit({ kind: 'msg', text: 'checking privately on this device…' });
-    const fd = new FormData();
-    fd.append('pdf', file);
-    const r = await fetch('/api/detect', { method: 'POST', body: fd });
-    if (!r.ok) throw new Error(await _formatErr(r));
-    emit({ kind: 'msg', text: 'parsing response…' });
-    return r.json();
-  },
-  async pageUrl(sessionId, n) {
-    return '/api/page/' + sessionId + '/' + n + '.png?zoom=1.5';
-  },
-  async redact(sessionId, occIds) {
-    const r = await fetch('/api/redact', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ session_id: sessionId, accepted_occurrence_ids: occIds }),
-    });
-    if (!r.ok) throw new Error(await _formatErr(r));
-    return r.blob();
-  },
-  async mark(sessionId, page, rect) {
-    const r = await fetch('/api/mark', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ session_id: sessionId, page, rect }),
-    });
-    if (!r.ok) throw new Error(await _formatErr(r));
-    const { entity } = await r.json();
-    return entity;
-  },
-  async deleteEntity(sessionId, entityId) {
-    const r = await fetch('/api/entity/' + sessionId + '/' + entityId, { method: 'DELETE' });
-    if (!r.ok) throw new Error(await _formatErr(r));
-  },
-};
-
-// ===== BrowserEngine: mupdf-wasm + transformers.js =====
 
 const MUPDF_URL = 'https://cdn.jsdelivr.net/npm/mupdf@1.27.0/dist/mupdf.js';
 const TRANSFORMERS_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@latest';
@@ -1296,7 +1085,7 @@ const BrowserEngine = {
     emit({ kind: 'msg', text: 'opening PDF…' });
     const mupdf = await _loadMupdf();
     if (!_classifier) {
-      emit({ kind: 'msg', text: 'first run: getting the private checker ready. Saved on this device for next time.' });
+      emit({ kind: 'msg', text: 'first run: getting the private checker ready. Saved in this browser for next time.' });
       await _loadClassifier(p => {
         if (p.phase === 'download') {
           emit({ kind: 'download', percent: p.percent, files: p.files });
@@ -1496,12 +1285,7 @@ function formatGpuLabel(fallback) {
 function engineTooltip(engineId) {
   if (engineId === 'loading') return 'Checking this device…';
   if (engineId === 'browser') {
-    const toggle = window.__browserCapable ? '\nClick to use the device app instead.' : '';
-    return `Your PDF is checked in this browser tab and never leaves this device.${toggle}`;
-  }
-  if (engineId === 'server') {
-    const toggle = window.__browserCapable ? '\nClick to check inside the browser tab instead.' : '';
-    return `Your PDF is checked by the app running on this device. No cloud upload.${toggle}`;
+    return 'Your PDF is checked in this browser tab and never leaves this device.';
   }
   if (engineId === 'unsupported') {
     return 'Hush PDF needs WebGPU so it can check PDFs privately in your browser. Use current Chrome or Edge with hardware acceleration enabled.';
@@ -1519,17 +1303,13 @@ function setPromiseCopy(engineId) {
     if (body) body.textContent = 'Your PDF is checked in this tab, without a cloud upload.';
     if (dropInf) dropInf.textContent = 'stays in this browser tab';
     if (dropIo) dropIo.textContent = 'removes selected text from the PDF';
-  } else {
-    if (title) title.textContent = 'Nothing leaves this machine.';
-    if (engineId === 'unsupported') {
-      if (body) body.textContent = 'Use current Chrome or Edge with WebGPU enabled to check PDFs privately on this device.';
-      if (dropInf) dropInf.textContent = 'requires WebGPU';
-      if (dropIo) dropIo.textContent = 'no cloud fallback';
-    } else {
-      if (body) body.textContent = 'Your PDF is checked by the app on this device, never in the cloud.';
-      if (dropInf) dropInf.textContent = 'stays on this device';
-      if (dropIo) dropIo.textContent = 'removes selected text from the PDF';
-    }
+    return;
+  }
+  if (engineId === 'unsupported') {
+    if (title) title.textContent = 'Nothing leaves this browser tab.';
+    if (body) body.textContent = 'Use current Chrome or Edge with WebGPU enabled to check PDFs privately on this device.';
+    if (dropInf) dropInf.textContent = 'requires WebGPU';
+    if (dropIo) dropIo.textContent = 'no cloud fallback';
   }
 }
 
@@ -1562,55 +1342,17 @@ const caps = await checkCaps();
 window.__caps = caps;
 const browserCapable = caps.webgpu && caps.maxBufferMB >= ENGINE_MIN_BUFFER_MB;
 
-const ENGINE_PREF_KEY = 'redactor.enginePref';
-function readEnginePref() {
-  try { return localStorage.getItem(ENGINE_PREF_KEY); } catch { return null; }
-}
-function writeEnginePref(v) {
-  try { localStorage.setItem(ENGINE_PREF_KEY, v); } catch {}
-}
-
-function pickEngine(forceId) {
-  if (HUSH_BROWSER_ONLY) return browserCapable ? BrowserEngine : UnsupportedEngine;
-  if (forceId === 'browser' && browserCapable) return BrowserEngine;
-  return ServerEngine;
-}
-
-let engine = pickEngine();
+let engine = browserCapable ? BrowserEngine : UnsupportedEngine;
 setEnginePill(engine.id, engine.label);
 setPromiseCopy(engine.id);
 window.__engine = engine;
 window.__BrowserEngine = BrowserEngine;
-window.__ServerEngine = ServerEngine;
 window.__browserCapable = browserCapable;
 
-function switchEngine(id) {
-  if (HUSH_BROWSER_ONLY) return engine.id === 'browser';
-  const next = id === 'browser' ? (browserCapable ? BrowserEngine : null) : ServerEngine;
-  if (!next) return false;
-  if (next.id === engine.id) return true;
-  engine = next;
-  window.__engine = engine;
-  setEnginePill(engine.id, engine.label);
-  setPromiseCopy(engine.id);
-  writeEnginePref(engine.id);
-  return true;
-}
-window.switchEngine = switchEngine;
-
-// Click on the engine pill to toggle (only when both engines are usable).
 let _detectInFlight = false;
 const enginePillEl = $('engine-pill');
 if (enginePillEl) {
-  enginePillEl.style.cursor = HUSH_BROWSER_ONLY ? 'help' : (browserCapable ? 'pointer' : 'help');
-  enginePillEl.addEventListener('click', () => {
-    if (HUSH_BROWSER_ONLY) return;
-    if (!browserCapable) return;
-    if (_detectInFlight) return;
-    const review = $('stage-review');
-    if (review && !review.classList.contains('hidden')) return; // mid-flow, ignore
-    switchEngine(engine.id === 'browser' ? 'server' : 'browser');
-  });
+  enginePillEl.style.cursor = 'help';
 }
 
 const stageUpload = $('stage-upload'), stageReview = $('stage-review'), stageDone = $('stage-done');
@@ -1733,7 +1475,7 @@ function renderUploadStatus(u, fname) {
     const pct = Math.max(0, Math.min(100, Math.round(u.percent || 0)));
     const fileLabel = u.files ? `${u.files} file${u.files === 1 ? '' : 's'}` : '';
     renderStatusPanel({
-      lineHtml: 'Getting the private checker ready · saved on this device for next time',
+      lineHtml: 'Getting the private checker ready · saved in this browser for next time',
       sub: `${pct}% · ${fileLabel}`,
       percent: pct,
     });
@@ -2424,379 +2166,10 @@ async function applyRedactions() {
   dl.download = 'cleaned-' + state.fileName;
   const sub = $('done-sub');
   if (sub) {
-    sub.textContent = 'Selected text was removed from the PDF. The original never left this machine.';
+    sub.textContent = 'Selected text was removed from the PDF. The original never left this browser tab.';
   }
   show('done');
 }
 </script>
 </body>
 </html>
-"""
-
-
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    return INDEX_HTML
-
-
-def coalesce(entities: list[dict], gap_chars: int = 2) -> list[dict]:
-    if not entities:
-        return []
-    es = sorted(entities, key=lambda e: e["start"])
-    merged: list[dict] = [dict(es[0])]
-    for e in es[1:]:
-        last = merged[-1]
-        last_label = last.get("entity_group") or last.get("entity")
-        e_label = e.get("entity_group") or e.get("entity")
-        if e_label == last_label and e["start"] - last["end"] <= gap_chars:
-            last["end"] = max(last["end"], e["end"])
-            last["score"] = min(last["score"], e["score"])
-        else:
-            merged.append(dict(e))
-    return merged
-
-
-def split_merged_span(label: str, text: str) -> list[str]:
-    if label == "PRIVATE_EMAIL":
-        return EMAIL_RE.findall(text) or [text]
-    if label == "PRIVATE_URL":
-        return URL_RE.findall(text) or [text]
-    if label == "PRIVATE_PHONE":
-        return PHONE_RE.findall(text) or [text]
-    return [text]
-
-
-def regex_backstop(text: str) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
-    for m in EMAIL_RE.finditer(text):
-        out.append(("PRIVATE_EMAIL", m.group()))
-    for m in URL_RE.finditer(text):
-        out.append(("PRIVATE_URL", m.group().rstrip(".,;:")))
-    for m in PHONE_RE.finditer(text):
-        s = m.group().strip()
-        digits = sum(c.isdigit() for c in s)
-        if digits >= 7:
-            out.append(("PRIVATE_PHONE", s))
-    return out
-
-
-def entities_from_outputs(text: str, model_output: list[dict]) -> set[tuple[str, str]]:
-    seen: set[tuple[str, str]] = set()
-    for e in coalesce(model_output):
-        if float(e.get("score", 1.0)) < MODEL_MIN_SCORE:
-            continue
-        label = (e.get("entity_group") or e.get("entity") or "").upper()
-        if not label:
-            continue
-        span = text[e["start"] : e["end"]].strip()
-        for piece in split_merged_span(label, span):
-            piece = piece.strip(" ,;:.()[]\"'")
-            if len(piece) >= 3:
-                seen.add((label, piece))
-    for label, s in regex_backstop(text):
-        s = s.strip(" ,;:.()[]\"'")
-        if len(s) >= 3:
-            seen.add((label, s))
-    return seen
-
-
-def liteparse_pdf(data: bytes) -> dict:
-    in_path = ""
-    out_path = ""
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as in_f:
-        in_f.write(data)
-        in_path = in_f.name
-    out_path = in_path + ".json"
-    try:
-        result = subprocess.run(
-            [
-                "npx", "-y", "@llamaindex/liteparse", "parse",
-                in_path, "--format", "json", "--no-ocr", "-q", "-o", out_path,
-            ],
-            capture_output=True,
-            timeout=300,
-        )
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"liteparse failed: {result.stderr.decode()[:500]}",
-            )
-        with open(out_path) as f:
-            return json.load(f)
-    finally:
-        for p in (in_path, out_path):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
-
-
-def _snippet(text: str, lo: int, hi: int, pad: int = 80) -> dict:
-    start = max(0, lo - pad)
-    end = min(len(text), hi + pad)
-    before = re.sub(r"\s+", " ", text[start:lo]).lstrip()
-    match = re.sub(r"\s+", " ", text[lo:hi]).strip()
-    after = re.sub(r"\s+", " ", text[hi:end]).rstrip()
-    return {
-        "before": ("…" + before) if start > 0 else before,
-        "match": match,
-        "after": (after + "…") if end < len(text) else after,
-    }
-
-
-def _find_all_offsets(text: str, needle: str) -> list[int]:
-    if not needle:
-        return []
-    out: list[int] = []
-    nl = needle.lower()
-    tl = text.lower()
-    lo = 0
-    while True:
-        idx = tl.find(nl, lo)
-        if idx < 0:
-            break
-        out.append(idx)
-        lo = idx + max(1, len(nl))
-    return out
-
-
-def detect_pdf(data: bytes) -> dict:
-    parsed = liteparse_pdf(data)
-    doc = fitz.open(stream=data, filetype="pdf")
-
-    page_texts = [p.get("text", "") for p in parsed.get("pages", [])]
-    n = min(len(page_texts), doc.page_count)
-    page_dimensions = [{"w": doc[i].rect.width, "h": doc[i].rect.height} for i in range(doc.page_count)]
-
-    non_empty_indices = [i for i in range(n) if page_texts[i].strip()]
-    non_empty_texts = [page_texts[i] for i in non_empty_indices]
-    raw_outputs = _classify_batched(non_empty_texts)
-    outputs_by_index = dict(zip(non_empty_indices, raw_outputs))
-
-    by_key: dict[tuple[str, str], dict] = {}
-    next_occ_id = 0
-
-    for i in range(n):
-        text = page_texts[i]
-        if not text.strip():
-            continue
-        page = doc[i]
-        for label, s in entities_from_outputs(text, outputs_by_index.get(i, [])):
-            rects = page.search_for(s, quads=False)
-            if not rects:
-                continue
-            offsets = _find_all_offsets(text, s)
-            key = (label, s)
-            rec = by_key.get(key)
-            if rec is None:
-                rec = {"label": label, "text": s, "occurrences": []}
-                by_key[key] = rec
-            for idx, r in enumerate(rects):
-                if idx < len(offsets):
-                    off = offsets[idx]
-                elif offsets:
-                    off = offsets[-1]
-                else:
-                    off = -1
-                snip = _snippet(text, off, off + len(s)) if off >= 0 else {
-                    "before": "", "match": s, "after": "",
-                }
-                rec["occurrences"].append({
-                    "id": next_occ_id,
-                    "page": i + 1,
-                    "rect": [r.x0, r.y0, r.x1, r.y1],
-                    "snippet": snip,
-                })
-                next_occ_id += 1
-
-    page_count = doc.page_count
-    doc.close()
-
-    entities = []
-    sorted_items = sorted(
-        by_key.items(),
-        key=lambda kv: (kv[0][0], -len(kv[1]["occurrences"]), kv[0][1]),
-    )
-    for ent_id, ((label, s), rec) in enumerate(sorted_items):
-        entities.append({
-            "id": ent_id,
-            "label": label,
-            "text": s,
-            "occurrences": rec["occurrences"],
-        })
-
-    occurrences_by_id = {
-        occ["id"]: {"entity_id": ent["id"], "page": occ["page"], "rect": occ["rect"]}
-        for ent in entities
-        for occ in ent["occurrences"]
-    }
-
-    session_id = secrets.token_urlsafe(16)
-    SESSIONS[session_id] = {
-        "pdf_bytes": data,
-        "entities": entities,
-        "pages": page_count,
-        "page_dimensions": page_dimensions,
-        "occurrences_by_id": occurrences_by_id,
-        "created_at": time.time(),
-    }
-    _gc_sessions()
-    return {
-        "session_id": session_id,
-        "pages": page_count,
-        "page_dimensions": page_dimensions,
-        "entities": entities,
-    }
-
-
-def apply_session_redactions(session_id: str, accepted_occ_ids: set[int]) -> tuple[bytes, dict[str, int]]:
-    s = SESSIONS.get(session_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="session expired or unknown")
-
-    occ_lookup = s["occurrences_by_id"]
-    ent_by_id = {e["id"]: e for e in s["entities"]}
-
-    by_page: dict[int, list[tuple[fitz.Rect, str]]] = defaultdict(list)
-    counts: dict[str, int] = defaultdict(int)
-    for oid in accepted_occ_ids:
-        rec = occ_lookup.get(oid)
-        if not rec:
-            continue
-        ent = ent_by_id.get(rec["entity_id"])
-        label = ent["label"] if ent else "UNKNOWN"
-        by_page[rec["page"] - 1].append((fitz.Rect(*rec["rect"]), label))
-
-    doc = fitz.open(stream=s["pdf_bytes"], filetype="pdf")
-    for page_idx, items in by_page.items():
-        page = doc[page_idx]
-        for rect, label in items:
-            page.add_redact_annot(rect, fill=(0, 0, 0))
-            counts[label] += 1
-        page.apply_redactions()
-
-    buf = io.BytesIO()
-    doc.save(buf, garbage=4, deflate=True, clean=True)
-    doc.close()
-    SESSIONS.pop(session_id, None)
-    return buf.getvalue(), dict(counts)
-
-
-@app.post("/api/detect")
-async def api_detect(pdf: UploadFile = File(...)) -> JSONResponse:
-    data = await pdf.read()
-    return JSONResponse(detect_pdf(data))
-
-
-class RedactRequest(BaseModel):
-    session_id: str
-    accepted_occurrence_ids: list[int]
-
-
-@app.post("/api/redact")
-async def api_redact(req: RedactRequest) -> Response:
-    out_pdf, _ = apply_session_redactions(req.session_id, set(req.accepted_occurrence_ids))
-    return Response(content=out_pdf, media_type="application/pdf")
-
-
-@app.post("/api/discard/{session_id}")
-def api_discard(session_id: str) -> JSONResponse:
-    existed = SESSIONS.pop(session_id, None) is not None
-    return JSONResponse({"discarded": existed})
-
-
-class MarkRequest(BaseModel):
-    session_id: str
-    page: int
-    rect: list[float]
-
-
-@app.post("/api/mark")
-def api_mark(req: MarkRequest) -> JSONResponse:
-    s = SESSIONS.get(req.session_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="session expired or unknown")
-    if req.page < 1 or req.page > s["pages"]:
-        raise HTTPException(status_code=404, detail="page out of range")
-    if len(req.rect) != 4:
-        raise HTTPException(status_code=400, detail="rect must be [x0, y0, x1, y1]")
-    x0, y0, x1, y1 = req.rect
-    rect = fitz.Rect(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
-    if rect.width < 2 or rect.height < 2:
-        raise HTTPException(status_code=400, detail="rect too small")
-
-    doc = fitz.open(stream=s["pdf_bytes"], filetype="pdf")
-    try:
-        page = doc[req.page - 1]
-        rect = rect & page.rect
-        if rect.is_empty:
-            raise HTTPException(status_code=400, detail="rect is outside the page")
-        words = page.get_text("words", clip=rect)
-        text_under = re.sub(r"\s+", " ", " ".join(w[4] for w in words)).strip()
-    finally:
-        doc.close()
-
-    if text_under:
-        display_text = text_under if len(text_under) <= 80 else text_under[:79].rstrip() + "…"
-    else:
-        display_text = "[marked region]"
-    next_ent_id = max((e["id"] for e in s["entities"]), default=-1) + 1
-    next_occ_id = max(s["occurrences_by_id"].keys(), default=-1) + 1
-    rect_coords = [rect.x0, rect.y0, rect.x1, rect.y1]
-    occurrence = {
-        "id": next_occ_id,
-        "page": req.page,
-        "rect": rect_coords,
-        "snippet": {"before": "", "match": display_text, "after": ""},
-    }
-    entity = {
-        "id": next_ent_id,
-        "label": "MANUAL",
-        "text": display_text,
-        "occurrences": [occurrence],
-    }
-    s["entities"].append(entity)
-    s["occurrences_by_id"][next_occ_id] = {
-        "entity_id": next_ent_id,
-        "page": req.page,
-        "rect": rect_coords,
-    }
-    return JSONResponse({"entity": entity})
-
-
-@app.delete("/api/entity/{session_id}/{entity_id}")
-def api_delete_entity(session_id: str, entity_id: int) -> JSONResponse:
-    s = SESSIONS.get(session_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="session expired or unknown")
-    target = next((e for e in s["entities"] if e["id"] == entity_id), None)
-    if not target:
-        raise HTTPException(status_code=404, detail="entity not found")
-    if target["label"] != "MANUAL":
-        raise HTTPException(status_code=400, detail="only manual marks can be deleted")
-    for occ in target["occurrences"]:
-        s["occurrences_by_id"].pop(occ["id"], None)
-    s["entities"] = [e for e in s["entities"] if e["id"] != entity_id]
-    return JSONResponse({"deleted": entity_id})
-
-
-@app.get("/api/page/{session_id}/{page_num}.png")
-def api_page(session_id: str, page_num: int, zoom: float = 1.5) -> Response:
-    s = SESSIONS.get(session_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="session expired or unknown")
-    if page_num < 1 or page_num > s["pages"]:
-        raise HTTPException(status_code=404, detail="page out of range")
-    zoom = max(0.5, min(3.0, zoom))
-    doc = fitz.open(stream=s["pdf_bytes"], filetype="pdf")
-    try:
-        page = doc[page_num - 1]
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-        png = pix.tobytes("png")
-    finally:
-        doc.close()
-    return Response(
-        content=png,
-        media_type="image/png",
-        headers={"Cache-Control": "private, max-age=600"},
-    )
