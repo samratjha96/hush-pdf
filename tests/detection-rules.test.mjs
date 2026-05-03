@@ -22,6 +22,9 @@ const text = [
   'SSN 123-45-6789.',
   'Card 4111 1111 1111 1111.',
   'Policy number ABC-12345.',
+  'Lease starts 08/12/2024.',
+  'Mail goes to 2600 Crystal Drive #423, Arlington VA 22202.',
+  'Taxpayer ID Number: ***-**-4684.',
   'api_key=sk_test_1234567890abcdef',
   'Visit https://example.com/private.',
 ].join('\n');
@@ -30,7 +33,9 @@ const labels = _findRuleSpans(text).map(span => span.label);
 
 assert(labels.includes('PRIVATE_EMAIL'), 'email should be detected');
 assert(labels.includes('PRIVATE_PHONE'), 'phone should be detected');
-assert(labels.filter(label => label === 'ACCOUNT_NUMBER').length >= 3, 'SSN, card, and policy IDs should be detected');
+assert(labels.includes('PRIVATE_DATE'), 'date should be detected');
+assert(labels.includes('PRIVATE_ADDRESS'), 'address should be detected');
+assert(labels.filter(label => label === 'ACCOUNT_NUMBER').length >= 4, 'SSN, card, policy IDs, and masked tax IDs should be detected');
 assert(labels.includes('SECRET'), 'secret should be detected');
 assert(labels.includes('PRIVATE_URL'), 'URL should be detected');
 assert.equal(_luhnOk('4111 1111 1111 1111'), true, 'known test card should pass Luhn');
