@@ -24,19 +24,6 @@ Then open `http://127.0.0.1:8765`.
 node tests/detection-rules.test.mjs
 ```
 
-## OpenMed WebGPU Model
-
-`scripts/build_openmed_webgpu.py` builds a Transformers.js q4 WebGPU artifact from `OpenMed/privacy-filter-nemotron` by transplanting its weights into the browser-compatible `openai/privacy-filter` graph:
-
-```bash
-uv run scripts/build_openmed_webgpu.py \
-  --openmed-dir /path/to/OpenMed/privacy-filter-nemotron \
-  --openai-dir /path/to/openai/privacy-filter \
-  --out-dir /path/to/privacy-filter-nemotron-webgpu
-```
-
-Upload that output directory to Hugging Face, then point `PRIVACY_MODEL_ID` in `public/index.html` at the hosted model repo.
-
 ## Browser Requirements
 
 Hush PDF needs WebGPU so the private checker can run locally in the browser.
@@ -58,4 +45,4 @@ npx wrangler deploy
 
 ## Credits
 
-[`openai/privacy-filter`](https://huggingface.co/openai/privacy-filter) · [`OpenMed/privacy-filter-nemotron`](https://huggingface.co/OpenMed/privacy-filter-nemotron) · [`mupdf-wasm`](https://mupdf.readthedocs.io/) · [`Transformers.js`](https://github.com/huggingface/transformers.js)
+[`openai/privacy-filter`](https://huggingface.co/openai/privacy-filter) · [`mupdf-wasm`](https://mupdf.readthedocs.io/) · [`Transformers.js`](https://github.com/huggingface/transformers.js)
