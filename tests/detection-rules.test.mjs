@@ -11,11 +11,11 @@ assert.notEqual(end, -1, 'rule helper block end not found');
 
 const sandbox = {};
 vm.runInNewContext(
-  html.slice(start, end) + '\nthis.__rules = { _findRuleSpans, _luhnOk };',
+  html.slice(start, end) + '\nthis.__rules = { _findRuleSpans, _luhnOk, _modelEntitySpans };',
   sandbox
 );
 
-const { _findRuleSpans, _luhnOk } = sandbox.__rules;
+const { _findRuleSpans, _luhnOk, _modelEntitySpans } = sandbox.__rules;
 
 const text = [
   'Email ada@example.com and call (415) 555-1212.',
@@ -40,5 +40,24 @@ assert(labels.includes('SECRET'), 'secret should be detected');
 assert(labels.includes('PRIVATE_URL'), 'URL should be detected');
 assert.equal(_luhnOk('4111 1111 1111 1111'), true, 'known test card should pass Luhn');
 assert.equal(_luhnOk('4111 1111 1111 1112'), false, 'invalid card should fail Luhn');
+
+const modelText = 'Contact Ada Lovelace at ada@example.com or 415-555-1212.';
+const modelSpans = _modelEntitySpans(modelText, [
+  { entity_group: 'first_name', score: 0.99, word: ' Ada' },
+  { entity_group: 'last_name', score: 0.98, word: ' Lovelace' },
+  { entity_group: 'email', score: 0.97, word: ' ada@example.com' },
+  { entity_group: 'phone_number', score: 0.96, word: '415-555-1212' },
+]);
+
+assert.equal(
+  JSON.stringify(modelSpans.map(span => [span.entity_group, modelText.slice(span.start, span.end)])),
+  JSON.stringify([
+    ['first_name', 'Ada'],
+    ['last_name', 'Lovelace'],
+    ['email', 'ada@example.com'],
+    ['phone_number', '415-555-1212'],
+  ]),
+  'model entities without offsets should be mapped back to source text'
+);
 
 console.log('detection rules ok');
