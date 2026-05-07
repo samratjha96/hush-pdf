@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hush PDF — private PDF cleanup</title>
+<title>Hush PDF — private PDF redaction</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -774,13 +774,13 @@
 <!-- ==================== UPLOAD STAGE ==================== -->
 <section id="stage-upload" class="upload-shell">
   <div class="left-col">
-    <div class="kicker">private PDF cleanup</div>
-    <h1>The PDF stays<br>on your laptop.</h1>
-    <p class="lead">Don’t get caught in your own Epstein files redaction fiasco.</p>
+    <div class="kicker">private PDF redaction</div>
+    <h1>Redact a PDF before<br>you share it.</h1>
+    <p class="lead">Find sensitive text, review every match, and download a copy with the selected text actually removed. No upload required.</p>
     <ul class="promises">
-      <li><span class="pmark"></span><div><b id="promise-1-title">Nothing leaves this browser tab.</b> <span id="promise-1-body">Your PDF is checked in this tab, without a cloud upload.</span></div></li>
-      <li><span class="pmark"></span><div><b>The Epstein-files lesson.</b> A black rectangle is not privacy if copy-paste can still find the text underneath.</div></li>
-      <li><span class="pmark"></span><div><b>You're in control.</b> Review every find, keep what belongs, and remove the rest.</div></li>
+      <li><span class="pmark"></span><div><b id="promise-1-title">Your PDF stays local.</b> <span id="promise-1-body">The check runs in this browser tab. No cloud AI call.</span></div></li>
+      <li><span class="pmark"></span><div><b>Black boxes are not enough.</b> If the text still copies, it was never really redacted.</div></li>
+      <li><span class="pmark"></span><div><b>Don’t get caught in your own Jeffrey Epstein redaction fiasco.</b> Review what will be removed before you download.</div></li>
     </ul>
   </div>
   <div class="right-col">
@@ -790,14 +790,14 @@
         <div class="drop-icon" aria-hidden="true">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z"/><path d="M12 17v-6"/><path d="M9 14l3-3 3 3"/></svg>
         </div>
-        <div class="drop-title">Drop a PDF, or click to choose</div>
-        <div class="drop-sub">Up to a few hundred pages</div>
+        <div class="drop-title">Drop a PDF to check it privately</div>
+        <div class="drop-sub">or click to choose a file</div>
       </label>
       <div class="drop-meta">
-        <div><b>Privacy</b><span id="drop-meta-inference">stays in this browser tab</span></div>
-        <div><b>Looks for</b>names, addresses, emails, phone numbers, links, dates, SSNs, accounts, secrets</div>
-        <div><b>Review</b>everything found is selected first</div>
-        <div><b>Result</b><span id="drop-meta-io">removes selected text from the PDF</span></div>
+        <div><b>Private</b><span id="drop-meta-inference">runs on this device</span></div>
+        <div><b>Finds</b>names, addresses, emails, phones, IDs, accounts, secrets</div>
+        <div><b>Review</b>every match before download</div>
+        <div><b>Output</b><span id="drop-meta-io">selected text is removed</span></div>
       </div>
     </div>
     <div id="upload-status" class="upload-status"></div>
@@ -872,13 +872,13 @@
     <div class="seal" aria-hidden="true">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
     </div>
-    <h2 id="done-title">Cleaned.</h2>
+    <h2 id="done-title">Redacted.</h2>
     <p class="sub" id="done-sub">Selected text was removed from the PDF. The original never left this browser tab.</p>
     <ul class="done-summary" id="done-summary"></ul>
     <div class="done-actions">
       <a class="download-btn" id="download-link" download="">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-        Download cleaned PDF
+        Download redacted PDF
       </a>
       <button class="ghost" id="redact-another">Clean another</button>
     </div>
@@ -1441,16 +1441,16 @@ function setPromiseCopy(engineId) {
   const dropInf = $('drop-meta-inference');
   const dropIo = $('drop-meta-io');
   if (engineId === 'browser') {
-    if (title) title.textContent = 'Nothing leaves this browser tab.';
-    if (body) body.textContent = 'Your PDF is checked in this tab, without a cloud upload.';
-    if (dropInf) dropInf.textContent = 'stays in this browser tab';
-    if (dropIo) dropIo.textContent = 'removes selected text from the PDF';
+    if (title) title.textContent = 'Your PDF stays local.';
+    if (body) body.textContent = 'The check runs in this browser tab. No cloud AI call.';
+    if (dropInf) dropInf.textContent = 'runs on this device';
+    if (dropIo) dropIo.textContent = 'selected text is removed';
     return;
   }
   if (engineId === 'unsupported') {
-    if (title) title.textContent = 'Nothing leaves this browser tab.';
-    if (body) body.textContent = 'Use current Chrome or Edge with WebGPU enabled to check PDFs privately on this device.';
-    if (dropInf) dropInf.textContent = 'requires WebGPU';
+    if (title) title.textContent = 'Your PDF stays local.';
+    if (body) body.textContent = 'Use current Chrome or Edge with browser GPU support to check PDFs privately on this device.';
+    if (dropInf) dropInf.textContent = 'needs browser GPU support';
     if (dropIo) dropIo.textContent = 'no cloud fallback';
   }
 }
@@ -1617,7 +1617,7 @@ function renderUploadStatus(u, fname) {
     const pct = Math.max(0, Math.min(100, Math.round(u.percent || 0)));
     const fileLabel = u.files ? `${u.files} file${u.files === 1 ? '' : 's'}` : '';
     renderStatusPanel({
-      lineHtml: 'Getting the private checker ready · saved in this browser for next time',
+      lineHtml: 'Getting private checking ready · saved in this browser for next time',
       sub: `${pct}% · ${fileLabel}`,
       percent: pct,
     });
@@ -1640,11 +1640,11 @@ function showUploadError(err) {
   let msg = raw;
   let help = '';
   if (raw === 'WEBGPU_UNAVAILABLE' || raw.includes('WebGPU is required')) {
-    msg = 'This browser cannot use WebGPU right now, so Hush PDF cannot check the file privately in the browser.';
+    msg = 'This browser cannot use private on-device checking right now.';
     help = webGpuHelpList();
   }
   if (raw === 'Failed to fetch' || raw.includes('Importing a module script failed')) {
-    msg = 'Could not download the private checker. A browser setting, VPN, firewall, or company network may be blocking the files needed to run privately in this browser.';
+    msg = 'Could not download the files needed for private on-device checking. A browser setting, VPN, firewall, or company network may be blocking them.';
     help =
       '<ol class="status-help">' +
         '<li>Try the latest Chrome or Microsoft Edge outside a VPN or strict company network.</li>' +
